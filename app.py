@@ -1,79 +1,83 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import re
-import json
-from typing import Dict, List, Optional
 import os
+from pydantic import BaseModel
+from typing import Optional, List
+import re
 
-app = FastAPI(title="MCP amoCRM Server")
+# Создание приложения FastAPI
+app = FastAPI(title="MCP amoCRM Server", version="1.0.0")
 
-# Получаем ключ из переменных окружения
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-
-# Ваш прайс-лист работ
-PRICE_LIST = [
-    "Межевание участка",
-    "Кадастровые работы", 
-    "Топографическая съемка",
-    "Вынос границ участка",
-    "Геодезические работы",
-    "Технический план",
-    "Акт обследования",
-    "Схема расположения",
-    "Проект межевания",
-    "Градостроительный план"
-]
+# Получение API ключа из переменных окружения
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 class TranscriptionRequest(BaseModel):
+    call_id: Optional[str] = None
     phone_number: str
     transcription_text: str
-    call_duration: int
-    call_id: Optional[str] = None
 
 def extract_amounts(text: str) -> List[float]:
     """Извлечение сумм из текста"""
-    amounts = []
-    
-    # Паттерны для поиска сумм
     patterns = [
-        (r'(\d+)\s*тысяч', 1000),
-        (r'(\d+)\s*тыс', 1000),
-        (r'(\d+)к\b', 1000),
-        (r'(\d+)\s*руб', 1),
-        (r'(\d+)\s*рублей', 1),
+        r'(\d+(?:[\s,]\d{3})*(?:\.\d{2})?)\s*(?:руб|рублей|₽)',
+        r'(\d+(?:[\s,]\d{3})*)\s*(?:тысяч|тыс)',
+        r'(\d+(?:[\s,]\d{3})*)\s*(?:миллионов?|млн)',
+        r'(\d+(?:\.\d+)?)\s*(?:миллионов?|млн)',
+        r'(\d+(?:\.\d+)?)\s*(?:тысяч|тыс)'
     ]
     
-    for pattern, multiplier in patterns:
-        matches = re.finditer(pattern, text, re.IGNORECASE)
+    amounts = []
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
         for match in matches:
-            number = float(match.group(1))
-            amounts.append(number * multiplier)
+            # Очищаем от пробелов и запятых
+            clean_match = match.replace(' ', '').replace(',', '')
+            try:
+                amount = float(clean_match)
+                # Конвертируем тысячи и миллионы
+                if 'тысяч' in text.lower() or 'тыс' in text.lower():
+                    amount *= 1000
+                elif 'миллион' in text.lower() or 'млн' in text.lower():
+                    amount *= 1000000
+                amounts.append(amount)
+            except ValueError:
+                continue
     
     return amounts
 
 def find_work_type(text: str) -> str:
-    """Поиск вида работ из прайс-листа"""
+    """Определение типа работ"""
+    work_types = {
+        'ремонт': ['ремонт', 'отремонтировать', 'починить'],
+        'строительство': ['строительство', 'построить', 'стройка'],
+        'отделка': ['отделка', 'отделать', 'покраска', 'поклейка'],
+        'сантехника': ['сантехника', 'сантехнические', 'водопровод', 'канализация'],
+        'электрика': ['электрика', 'электрические', 'проводка', 'розетки'],
+        'дизайн': ['дизайн', 'дизайнерские', 'интерьер']
+    }
+    
     text_lower = text.lower()
-    for work in PRICE_LIST:
-        if work.lower() in text_lower or any(word in text_lower for word in work.lower().split()):
-            return work
-    return "Консультация"
+    for work_type, keywords in work_types.items():
+        for keyword in keywords:
+            if keyword in text_lower:
+                return work_type
+    
+    return "не определен"
 
 def extract_location(text: str) -> str:
-    """Извлечение местоположения"""
-    patterns = [
-        r'в\s+([А-Я][а-я]+(?:\s+[А-Я][а-я]+)*)',
-        r'город\s+([А-Я][а-я]+)',
-        r'на\s+улице\s+([^,\.]+)',
-        r'по\s+адресу\s+([^,\.]+)',
+    """Извлечение адреса/локации"""
+    location_patterns = [
+        r'(?:по адресу|адрес)\s*:?\s*([^,.!?\n]+)',
+        r'(?:улица|ул\.)\s*([^,.!?\n]+)',
+        r'(?:район|р-н)\s*([^,.!?\n]+)',
+        r'(?:город|г\.)\s*([^,.!?\n]+)'
     ]
     
-    for pattern in patterns:
-        match = re.search(pattern, text)
+    for pattern in location_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
         if match:
             return match.group(1).strip()
     
-    return "Не указано"
+    return "не указан"
 
 def extract_next_steps(text: str) -> str:
     """Извлечение следующих шагов"""
@@ -147,8 +151,8 @@ async def test_extraction(text: str):
         "next_steps": extract_next_steps(text)
     }
 
+# Запуск сервера
 if __name__ == "__main__":
-    import os
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)

@@ -150,9 +150,3 @@ async def test_extraction(text: str):
         "location": extract_location(text),
         "next_steps": extract_next_steps(text)
     }
-
-# Запуск сервера для Railway
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)

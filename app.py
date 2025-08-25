@@ -15,6 +15,9 @@ class TranscriptionRequest(BaseModel):
     phone_number: str
     transcription_text: str
 
+class TestRequest(BaseModel):
+    text: str
+
 def extract_amounts(text: str) -> List[float]:
     """Извлечение сумм из текста"""
     patterns = [
@@ -100,6 +103,24 @@ def extract_next_steps(text: str) -> str:
     
     return "Ожидание решения клиента"
 
+@app.get("/")
+async def root():
+    return {"message": "MCP amoCRM Server работает!", "status": "active"}
+
+@app.get("/status")
+async def status():
+    """Базовый endpoint для проверки статуса сервера"""
+    return {
+        "status": "ok",
+        "service": "MCP amoCRM Server",
+        "version": "1.0.0",
+        "api_key_configured": bool(ANTHROPIC_API_KEY)
+    }
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "api_key_set": bool(ANTHROPIC_API_KEY)}
+
 @app.post("/webhook/transcription")
 async def process_transcription(request: TranscriptionRequest):
     """Обработка расшифровки звонка"""
@@ -132,21 +153,13 @@ async def process_transcription(request: TranscriptionRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/")
-async def root():
-    return {"message": "MCP amoCRM Server работает!", "status": "active"}
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "api_key_set": bool(ANTHROPIC_API_KEY)}
-
-# Для отладки
+# Для отладки - исправлен для правильного использования с Pydantic
 @app.post("/test")
-async def test_extraction(text: str):
+async def test_extraction(request: TestRequest):
     """Тестовый endpoint для проверки извлечения"""
     return {
-        "amounts": extract_amounts(text),
-        "work_type": find_work_type(text),
-        "location": extract_location(text),
-        "next_steps": extract_next_steps(text)
+        "amounts": extract_amounts(request.text),
+        "work_type": find_work_type(request.text),
+        "location": extract_location(request.text),
+        "next_steps": extract_next_steps(request.text)
     }

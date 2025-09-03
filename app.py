@@ -109,6 +109,11 @@ def root():
         }
     }
 
+@app.get("/health")
+def health_check():
+    """Health check для Railway"""
+    return {"status": "healthy"}
+
 @app.get("/api/account")
 async def get_account(authorization: Optional[str] = Header(None)):
     """Получение информации об аккаунте"""

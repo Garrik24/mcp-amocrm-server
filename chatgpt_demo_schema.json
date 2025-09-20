@@ -1,0 +1,113 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "AmoCRM GPT Assistant",
+    "description": "API для интеграции AmoCRM с ChatGPT. Позволяет получать информацию о сделках, контактах, создавать новые записи и управлять данными AmoCRM.",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "https://mcp-amocrm-server.up.railway.app",
+      "description": "Публичный AmoCRM сервер на Railway"
+    }
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "summary": "Получить статус сервера",
+        "description": "Возвращает информацию о статусе AmoCRM сервера и доступных эндпоинтах",
+        "operationId": "get_server_status",
+        "responses": {
+          "200": {
+            "description": "Статус сервера",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {"type": "string"},
+                    "service": {"type": "string"},
+                    "version": {"type": "string"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/entities": {
+      "post": {
+        "summary": "Работа с сущностями AmoCRM",
+        "description": "Универсальный метод для получения, создания, обновления сделок, контактов, компаний",
+        "operationId": "manage_amocrm_entities",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "entity_type": {
+                    "type": "string",
+                    "enum": ["leads", "contacts", "companies", "tasks", "customers"],
+                    "description": "Тип сущности"
+                  },
+                  "method": {
+                    "type": "string", 
+                    "enum": ["get", "post", "patch", "delete"],
+                    "description": "HTTP метод операции"
+                  },
+                  "entity_id": {
+                    "type": "integer",
+                    "description": "ID сущности (для get/patch/delete)"
+                  },
+                  "data": {
+                    "type": "object",
+                    "description": "Данные для создания/обновления"
+                  },
+                  "params": {
+                    "type": "object",
+                    "description": "Параметры запроса (лимит, фильтры и т.д.)"
+                  }
+                },
+                "required": ["entity_type", "method"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Результат операции",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/account": {
+      "get": {
+        "summary": "Информация об аккаунте",
+        "description": "Получить информацию об аккаунте AmoCRM",
+        "operationId": "get_account_info",
+        "responses": {
+          "200": {
+            "description": "Информация об аккаунте",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

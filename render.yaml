@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: amocrm-mcp-server
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.0
+      - key: AMOCRM_CLIENT_ID
+        value: your_client_id_here
+      - key: AMOCRM_CLIENT_SECRET
+        value: your_client_secret_here
+      - key: AMOCRM_SUBDOMAIN
+        value: your_subdomain_here
+      - key: AMOCRM_ACCESS_TOKEN
+        value: your_access_token_here

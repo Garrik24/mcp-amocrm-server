@@ -2,20 +2,19 @@
   "openapi": "3.1.0",
   "info": {
     "title": "AmoCRM GPT Assistant",
-    "description": "API для интеграции AmoCRM с ChatGPT. Позволяет получать информацию о сделках, контактах, создавать новые записи и управлять данными AmoCRM.",
+    "description": "API для интеграции AmoCRM с ChatGPT",
     "version": "1.0.0"
   },
   "servers": [
     {
-      "url": "http://127.0.0.1:8000",
-      "description": "Публичный AmoCRM сервер на Railway"
+      "url": "https://127.0.0.1:8000",
+      "description": "Локальный AmoCRM сервер"
     }
   ],
   "paths": {
     "/": {
       "get": {
-        "summary": "Получить статус сервера",
-        "description": "Возвращает информацию о статусе AmoCRM сервера и доступных эндпоинтах",
+        "summary": "Статус сервера",
         "operationId": "get_server_status",
         "responses": {
           "200": {
@@ -39,7 +38,6 @@
     "/api/entities": {
       "post": {
         "summary": "Работа с сущностями AmoCRM",
-        "description": "Универсальный метод для получения, создания, обновления сделок, контактов, компаний",
         "operationId": "manage_amocrm_entities",
         "requestBody": {
           "required": true,
@@ -50,25 +48,21 @@
                 "properties": {
                   "entity_type": {
                     "type": "string",
-                    "enum": ["leads", "contacts", "companies", "tasks", "customers"],
+                    "enum": ["leads", "contacts", "companies"],
                     "description": "Тип сущности"
                   },
                   "method": {
                     "type": "string", 
-                    "enum": ["get", "post", "patch", "delete"],
-                    "description": "HTTP метод операции"
-                  },
-                  "entity_id": {
-                    "type": "integer",
-                    "description": "ID сущности (для get/patch/delete)"
-                  },
-                  "data": {
-                    "type": "object",
-                    "description": "Данные для создания/обновления"
+                    "enum": ["get", "post"],
+                    "description": "Метод операции"
                   },
                   "params": {
                     "type": "object",
-                    "description": "Параметры запроса (лимит, фильтры и т.д.)"
+                    "description": "Параметры (лимит, фильтры)"
+                  },
+                  "data": {
+                    "type": "object", 
+                    "description": "Данные для создания"
                   }
                 },
                 "required": ["entity_type", "method"]
@@ -93,7 +87,6 @@
     "/api/account": {
       "get": {
         "summary": "Информация об аккаунте",
-        "description": "Получить информацию об аккаунте AmoCRM",
         "operationId": "get_account_info",
         "responses": {
           "200": {

@@ -72,23 +72,45 @@ async def make_amocrm_request(endpoint: str, method: str = "GET", data: Dict = N
     url = f"https://{AMOCRM_SUBDOMAIN}.amocrm.ru{endpoint}"
     headers = {
         "Authorization": f"Bearer {AMOCRM_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Accept": "application/json"
     }
     
     async with aiohttp.ClientSession() as session:
         try:
             if method.upper() == "GET":
                 async with session.get(url, headers=headers, params=params) as response:
-                    return await response.json()
+                    if response.status == 204:
+                        return {"status": "no_content", "code": 204}
+                    try:
+                        return await response.json()
+                    except Exception:
+                        return {"code": response.status, "text": await response.text()}
             elif method.upper() == "POST":
                 async with session.post(url, headers=headers, json=data) as response:
-                    return await response.json()
+                    if response.status == 204:
+                        return {"status": "no_content", "code": 204}
+                    try:
+                        return await response.json()
+                    except Exception:
+                        return {"code": response.status, "text": await response.text()}
             elif method.upper() == "PATCH":
                 async with session.patch(url, headers=headers, json=data) as response:
-                    return await response.json()
+                    if response.status == 204:
+                        return {"status": "no_content", "code": 204}
+                    try:
+                        return await response.json()
+                    except Exception:
+                        return {"code": response.status, "text": await response.text()}
             elif method.upper() == "DELETE":
                 async with session.delete(url, headers=headers) as response:
-                    return await response.json()
+                    if response.status in (200, 202, 204):
+                        # У AmoCRM при успешном удалении часто 204 и пустой ответ
+                        return {"status": "deleted", "code": response.status}
+                    try:
+                        return await response.json()
+                    except Exception:
+                        return {"code": response.status, "text": await response.text()}
         except Exception as e:
             logger.error(f"Ошибка запроса к AmoCRM: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Ошибка запроса к AmoCRM: {str(e)}")
@@ -138,6 +160,17 @@ async def handle_entities(request: EntityRequest, authorization: Optional[str] =
         return result
     except Exception as e:
         logger.error(f"Ошибка обработки сущности: {str(e)}")
+        return {"error": str(e), "status": "error"}
+
+@app.delete("/api/entities/{entity_type}/{entity_id}")
+async def delete_entity(entity_type: str, entity_id: int, authorization: Optional[str] = Header(None)):
+    """Удаление сущности напрямую через DELETE (рекомендуемый способ для AmoCRM v4)."""
+    try:
+        endpoint = f"/api/v4/{entity_type}/{entity_id}"
+        result = await make_amocrm_request(endpoint, "DELETE")
+        return result
+    except Exception as e:
+        logger.error(f"Ошибка удаления {entity_type}/{entity_id}: {str(e)}")
         return {"error": str(e), "status": "error"}
 
 @app.get("/api/pipelines")
@@ -255,3 +288,4 @@ async def get_deals_report(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

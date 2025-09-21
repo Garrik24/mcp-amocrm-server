@@ -1,0 +1,34 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "AmoCRM GPT Assistant",
+    "description": "API для интеграции AmoCRM с ChatGPT",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "https://httpbin.org",
+      "description": "Тестовый сервер для демонстрации"
+    }
+  ],
+  "paths": {
+    "/get": {
+      "get": {
+        "summary": "Тестовый запрос",
+        "operationId": "test_request",
+        "responses": {
+          "200": {
+            "description": "Успешный ответ",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

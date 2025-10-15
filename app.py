@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List, Union
 import os
@@ -14,6 +15,15 @@ app = FastAPI(
     title="AmoCRM MCP Server",
     description="Сервер для интеграции с AmoCRM API через долгосрочный токен",
     version="3.0.0"
+)
+
+# CORS (разрешаем доступ для LLM/браузеров; при проде лучше ограничить домены)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Конфигурация из переменных окружения
@@ -63,6 +73,52 @@ async def root():
 async def health_check():
     """Health check для Railway"""
     return {"status": "healthy", "timestamp": int(time.time())}
+
+# ===================== MCP over HTTP (для ChatGPT Connectors и любых клиентов MCP по сети) =====================
+# Реализуем SSE/POST транспорт MCP по адресу /mcp
+try:
+    # Импортируем наш MCP-сервер (реестр инструментов) и HTTP транспорт из mcp
+    from mcp_server import app as mcp_app
+    from mcp.server.sse import SseServerTransport, TransportSecuritySettings
+
+    # Создаем транспорт SSE: GET /mcp/sse открывает поток событий, POST /mcp/messages принимает сообщения
+    security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    sse_transport = SseServerTransport(endpoint="/messages", security_settings=security)
+
+    # Единое ASGI-приложение для путей /mcp/sse (GET) и /mcp/messages (POST)
+    async def mcp_http_root(scope, receive, send):
+        if scope["type"] != "http":
+            return await send({
+                "type": "http.response.start",
+                "status": 404,
+                "headers": []
+            })
+        # Когда приложение смонтировано на /mcp, внутри дочернего scope['path'] будет относительным
+        path = scope.get("path", "")
+        method = scope.get("method", "GET").upper()
+        if path == "/sse" and method == "GET":
+            async with sse_transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
+                await mcp_app.run(
+                    read_stream,
+                    write_stream,
+                    mcp_app.create_initialization_options(),
+                )
+            return
+        if path == "/messages" and method == "POST":
+            return await sse_transport.handle_post_message(scope, receive, send)
+        # 404 для остальных путей
+        await send({
+            "type": "http.response.start",
+            "status": 404,
+            "headers": []
+        })
+        await send({"type": "http.response.body", "body": b""})
+
+    # Монтируем ASGI приложение на /mcp
+    app.mount("/mcp", mcp_http_root)
+except Exception as _mcp_http_err:
+    # Если MCP HTTP транспорт недоступен, просто логируем. REST API продолжит работать.
+    logger.warning(f"MCP HTTP transport not enabled: {_mcp_http_err}")
 
 async def make_amocrm_request(endpoint: str, method: str = "GET", data: Dict = None, params: Dict = None):
     """Выполняет запрос к AmoCRM API"""

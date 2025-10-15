@@ -285,6 +285,343 @@ async def get_deals_report(
         logger.error(f"Ошибка получения отчета по сделкам: {str(e)}")
         return {"error": str(e), "status": "error"}
 
+
+@app.get("/api/contacts/search")
+async def search_contacts(
+    query: str = Query(..., description="Email, телефон или имя для поиска"),
+    limit: int = Query(10, description="Количество результатов"),
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Поиск контактов по email, телефону или имени.
+    Возвращает список найденных контактов с полной информацией.
+    """
+    try:
+        result = await make_amocrm_request(
+            "/api/v4/contacts",
+            "GET",
+            params={"query": query, "limit": limit, "with": "leads"}
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Ошибка поиска контактов: {str(e)}")
+        return {"error": str(e), "status": "error"}
+
+
+@app.post("/api/contacts/check-exists")
+async def check_contact_exists(
+    query: str = Query(..., description="Email или телефон для проверки"),
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Проверка существования контакта по email или телефону.
+    Возвращает информацию о наличии контакта и его ID если найден.
+    """
+    try:
+        result = await make_amocrm_request(
+            "/api/v4/contacts",
+            "GET",
+            params={"query": query, "limit": 1}
+        )
+        
+        exists = False
+        contact_id = None
+        contact_data = None
+        
+        if "_embedded" in result and "contacts" in result["_embedded"]:
+            contacts = result["_embedded"]["contacts"]
+            if len(contacts) > 0:
+                exists = True
+                contact_id = contacts[0]["id"]
+                contact_data = contacts[0]
+        
+        return {
+            "exists": exists,
+            "contact_id": contact_id,
+            "contact": contact_data,
+            "query": query
+        }
+    except Exception as e:
+        logger.error(f"Ошибка проверки контакта: {str(e)}")
+        return {"error": str(e), "status": "error"}
+
+
+@app.post("/api/contacts/get-or-create")
+async def get_or_create_contact(request: Dict[str, Any]):
+    """
+    Получить контакт если существует, или создать новый.
+    Умная операция: сначала ищет по query, если не находит - создает.
+    
+    Body:
+    {
+        "query": "email или телефон",
+        "name": "Имя контакта",
+        "email": "email@example.com",
+        "phone": "+79991234567"
+    }
+    """
+    try:
+        query = request.get("query")
+        if not query:
+            return {"error": "Параметр query обязателен", "status": "error"}
+        
+        # Ищем контакт
+        search_result = await make_amocrm_request(
+            "/api/v4/contacts",
+            "GET",
+            params={"query": query, "limit": 1}
+        )
+        
+        if "_embedded" in search_result and "contacts" in search_result["_embedded"]:
+            contacts = search_result["_embedded"]["contacts"]
+            if len(contacts) > 0:
+                return {
+                    "found": True,
+                    "created": False,
+                    "contact": contacts[0]
+                }
+        
+        # Создаем новый контакт
+        contact_data = {
+            "name": request.get("name", "Новый контакт")
+        }
+        
+        custom_fields = []
+        if "email" in request:
+            custom_fields.append({
+                "field_code": "EMAIL",
+                "values": [{"value": request["email"], "enum_code": "WORK"}]
+            })
+        if "phone" in request:
+            custom_fields.append({
+                "field_code": "PHONE",
+                "values": [{"value": request["phone"], "enum_code": "WORK"}]
+            })
+        
+        if custom_fields:
+            contact_data["custom_fields_values"] = custom_fields
+        
+        create_result = await make_amocrm_request(
+            "/api/v4/contacts",
+            "POST",
+            data=[contact_data]
+        )
+        
+        return {
+            "found": False,
+            "created": True,
+            "contact": create_result
+        }
+        
+    except Exception as e:
+        logger.error(f"Ошибка get_or_create_contact: {str(e)}")
+        return {"error": str(e), "status": "error"}
+
+
+@app.post("/api/leads/create-with-contact")
+async def create_lead_with_contact(request: Dict[str, Any]):
+    """
+    Создание сделки с контактом (комплексное создание).
+    Если contact_id указан - связывает с существующим контактом.
+    Если нет - создает новый контакт вместе со сделкой.
+    
+    Body:
+    {
+        "lead_name": "Название сделки",
+        "lead_price": 10000,
+        "contact_id": 123456,  // опционально, если есть
+        "contact_name": "Имя контакта",  // если создаем новый
+        "contact_email": "email@example.com",
+        "contact_phone": "+79991234567"
+    }
+    """
+    try:
+        lead_data = {
+            "name": request.get("lead_name", "Новая сделка")
+        }
+        
+        if "lead_price" in request:
+            lead_data["price"] = request["lead_price"]
+        
+        # Если указан ID существующего контакта
+        if "contact_id" in request:
+            lead_data["_embedded"] = {
+                "contacts": [{"id": request["contact_id"]}]
+            }
+        else:
+            # Создаем контакт вместе со сделкой
+            contact_data = {
+                "name": request.get("contact_name", "Новый контакт")
+            }
+            
+            custom_fields = []
+            if "contact_email" in request:
+                custom_fields.append({
+                    "field_code": "EMAIL",
+                    "values": [{"value": request["contact_email"], "enum_code": "WORK"}]
+                })
+            if "contact_phone" in request:
+                custom_fields.append({
+                    "field_code": "PHONE",
+                    "values": [{"value": request["contact_phone"], "enum_code": "WORK"}]
+                })
+            
+            if custom_fields:
+                contact_data["custom_fields_values"] = custom_fields
+            
+            lead_data["_embedded"] = {
+                "contacts": [contact_data]
+            }
+        
+        # Используем complex endpoint для создания
+        result = await make_amocrm_request(
+            "/api/v4/leads/complex",
+            "POST",
+            data=[lead_data]
+        )
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Ошибка создания сделки с контактом: {str(e)}")
+        return {"error": str(e), "status": "error"}
+
+
+@app.post("/api/smart/client-and-lead")
+async def smart_create_client_and_lead(request: Dict[str, Any]):
+    """
+    УМНОЕ создание: полный цикл работы с клиентом и сделкой.
+    
+    Алгоритм:
+    1. Проверяет существование контакта по email/телефону
+    2. Если не существует - создает контакт
+    3. Проверяет есть ли у контакта открытые сделки
+    4. Если нет - создает новую сделку
+    
+    Body:
+    {
+        "contact_query": "email или телефон",
+        "contact_name": "Имя контакта",
+        "contact_email": "email@example.com",
+        "contact_phone": "+79991234567",
+        "lead_name": "Название сделки",
+        "lead_price": 10000,
+        "check_existing_leads": true  // проверять ли наличие сделок
+    }
+    """
+    try:
+        query = request.get("contact_query")
+        if not query:
+            return {"error": "Параметр contact_query обязателен", "status": "error"}
+        
+        steps = []
+        
+        # Шаг 1: Проверяем контакт
+        steps.append("Проверка существования контакта...")
+        search_result = await make_amocrm_request(
+            "/api/v4/contacts",
+            "GET",
+            params={"query": query, "limit": 1, "with": "leads"}
+        )
+        
+        contact_id = None
+        contact_exists = False
+        
+        if "_embedded" in search_result and "contacts" in search_result["_embedded"]:
+            contacts = search_result["_embedded"]["contacts"]
+            if len(contacts) > 0:
+                contact_exists = True
+                contact_id = contacts[0]["id"]
+                steps.append(f"✓ Контакт найден (ID: {contact_id})")
+        
+        # Шаг 2: Создаем контакт если не существует
+        if not contact_exists:
+            steps.append("Создание нового контакта...")
+            contact_data = {
+                "name": request.get("contact_name", "Новый контакт")
+            }
+            
+            custom_fields = []
+            if "contact_email" in request:
+                custom_fields.append({
+                    "field_code": "EMAIL",
+                    "values": [{"value": request["contact_email"], "enum_code": "WORK"}]
+                })
+            if "contact_phone" in request:
+                custom_fields.append({
+                    "field_code": "PHONE",
+                    "values": [{"value": request["contact_phone"], "enum_code": "WORK"}]
+                })
+            
+            if custom_fields:
+                contact_data["custom_fields_values"] = custom_fields
+            
+            create_result = await make_amocrm_request(
+                "/api/v4/contacts",
+                "POST",
+                data=[contact_data]
+            )
+            
+            if "_embedded" in create_result and "contacts" in create_result["_embedded"]:
+                contact_id = create_result["_embedded"]["contacts"][0]["id"]
+                steps.append(f"✓ Контакт создан (ID: {contact_id})")
+        
+        # Шаг 3: Проверяем существующие сделки если нужно
+        should_create_lead = True
+        if request.get("check_existing_leads", True) and contact_id:
+            steps.append("Проверка существующих сделок...")
+            leads_result = await make_amocrm_request(
+                "/api/v4/leads",
+                "GET",
+                params={
+                    "filter[contacts][0]": contact_id,
+                    "limit": 1
+                }
+            )
+            
+            if "_embedded" in leads_result and "leads" in leads_result["_embedded"]:
+                leads = leads_result["_embedded"]["leads"]
+                if len(leads) > 0:
+                    should_create_lead = False
+                    steps.append(f"! У контакта уже есть сделки ({len(leads)} шт.)")
+        
+        # Шаг 4: Создаем сделку
+        lead_result = None
+        if should_create_lead and contact_id:
+            steps.append("Создание сделки...")
+            lead_data = {
+                "name": request.get("lead_name", "Новая сделка"),
+                "_embedded": {
+                    "contacts": [{"id": contact_id}]
+                }
+            }
+            
+            if "lead_price" in request:
+                lead_data["price"] = request["lead_price"]
+            
+            lead_result = await make_amocrm_request(
+                "/api/v4/leads",
+                "POST",
+                data=[lead_data]
+            )
+            
+            if "_embedded" in lead_result and "leads" in lead_result["_embedded"]:
+                lead_id = lead_result["_embedded"]["leads"][0]["id"]
+                steps.append(f"✓ Сделка создана (ID: {lead_id})")
+        
+        return {
+            "success": True,
+            "steps": steps,
+            "contact_id": contact_id,
+            "contact_was_created": not contact_exists,
+            "lead_was_created": should_create_lead,
+            "lead_result": lead_result
+        }
+        
+    except Exception as e:
+        logger.error(f"Ошибка smart_create_client_and_lead: {str(e)}")
+        return {"error": str(e), "status": "error", "steps": steps}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

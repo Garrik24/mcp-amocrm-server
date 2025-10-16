@@ -101,45 +101,47 @@ try:
     from mcp_server import app as mcp_app
     from mcp.server.sse import SseServerTransport, TransportSecuritySettings
 
-    # Создаем транспорт SSE: GET /mcp/sse открывает поток событий, POST /mcp/messages принимает сообщения
+    # Создаем транспорт SSE
     security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-    sse_transport = SseServerTransport(endpoint="/messages", security_settings=security)
+    sse_transport = SseServerTransport(endpoint="/mcp/messages", security_settings=security)
 
-    # Единое ASGI-приложение для путей /mcp/sse (GET) и /mcp/messages (POST)
-    async def mcp_http_root(scope, receive, send):
-        if scope["type"] != "http":
-            return await send({
-                "type": "http.response.start",
-                "status": 404,
-                "headers": []
-            })
-        # Когда приложение смонтировано на /mcp, внутри дочернего scope['path'] будет относительным
+    # Создаем ASGI приложение которое обрабатывает /mcp/*
+    async def mcp_asgi_app(scope, receive, send):
+        """ASGI middleware для MCP endpoints"""
         path = scope.get("path", "")
-        method = scope.get("method", "GET").upper()
+        method = scope.get("method", "GET")
         
-        # Debug логирование
-        logger.info(f"MCP request: path={path}, method={method}, full_path={scope.get('raw_path', b'').decode()}")
+        logger.info(f"📡 MCP ASGI called: {method} {path}")
         
         if path == "/sse" and method == "GET":
+            logger.info("🔌 Connecting SSE stream...")
+            # Обрабатываем SSE соединение
             async with sse_transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
                 await mcp_app.run(
                     read_stream,
                     write_stream,
                     mcp_app.create_initialization_options(),
                 )
-            return
-        if path == "/messages" and method == "POST":
-            return await sse_transport.handle_post_message(scope, receive, send)
-        # 404 для остальных путей
-        await send({
-            "type": "http.response.start",
-            "status": 404,
-            "headers": []
-        })
-        await send({"type": "http.response.body", "body": b""})
-
-    # Монтируем ASGI приложение на /mcp
-    app.mount("/mcp", mcp_http_root)
+        elif path == "/messages" and method == "POST":
+            logger.info("📨 Handling POST message...")
+            # Обрабатываем POST сообщение
+            await sse_transport.handle_post_message(scope, receive, send)
+        else:
+            # 404 для неизвестных путей
+            logger.warning(f"❌ Unknown MCP path: {method} {path}")
+            await send({
+                "type": "http.response.start",
+                "status": 404,
+                "headers": [[b"content-type", b"text/plain"]],
+            })
+            await send({
+                "type": "http.response.body",
+                "body": f"Not Found: {path}. Expected /sse or /messages".encode(),
+            })
+    
+    # Монтируем ASGI приложение
+    app.mount("/mcp", mcp_asgi_app)
+    
     logger.info("✅ MCP HTTP transport enabled at /mcp/sse and /mcp/messages")
 except Exception as _mcp_http_err:
     # Если MCP HTTP транспорт недоступен, просто логируем. REST API продолжит работать.

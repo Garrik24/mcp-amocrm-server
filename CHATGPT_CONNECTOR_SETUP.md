@@ -154,3 +154,5 @@ https://mcp-amocrm-server-production.up.railway.app
 **Версия:** 1.0  
 **Обновлено:** Октябрь 2025
 
+
+

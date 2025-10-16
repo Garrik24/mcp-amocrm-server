@@ -401,3 +401,4 @@ curl -X POST "http://localhost:8000/api/smart/client-and-lead" \
 **Версия:** 1.0  
 **Обновлено:** Октябрь 2025
 
+

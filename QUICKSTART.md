@@ -198,3 +198,4 @@ curl -X POST "http://localhost:8000/api/contacts/check-exists?query=test@example
 
 **Готово! Теперь можете использовать AmoCRM через Claude!** 🎉
 
+

@@ -116,6 +116,10 @@ try:
         # Когда приложение смонтировано на /mcp, внутри дочернего scope['path'] будет относительным
         path = scope.get("path", "")
         method = scope.get("method", "GET").upper()
+        
+        # Debug логирование
+        logger.info(f"MCP request: path={path}, method={method}, full_path={scope.get('raw_path', b'').decode()}")
+        
         if path == "/sse" and method == "GET":
             async with sse_transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
                 await mcp_app.run(

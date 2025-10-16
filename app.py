@@ -74,6 +74,26 @@ async def health_check():
     """Health check для Railway"""
     return {"status": "healthy", "timestamp": int(time.time())}
 
+@app.get("/debug/mcp-status")
+async def mcp_status():
+    """Проверка статуса MCP интеграции"""
+    mcp_enabled = False
+    mcp_error = None
+    
+    try:
+        from mcp_server import app as mcp_app
+        from mcp.server.sse import SseServerTransport
+        mcp_enabled = True
+    except Exception as e:
+        mcp_error = str(e)
+    
+    return {
+        "mcp_enabled": mcp_enabled,
+        "mcp_error": mcp_error,
+        "mcp_endpoint": "/mcp/sse" if mcp_enabled else None,
+        "mcp_version": "1.17.0" if mcp_enabled else None
+    }
+
 # ===================== MCP over HTTP (для ChatGPT Connectors и любых клиентов MCP по сети) =====================
 # Реализуем SSE/POST транспорт MCP по адресу /mcp
 try:
@@ -116,9 +136,12 @@ try:
 
     # Монтируем ASGI приложение на /mcp
     app.mount("/mcp", mcp_http_root)
+    logger.info("✅ MCP HTTP transport enabled at /mcp/sse and /mcp/messages")
 except Exception as _mcp_http_err:
     # Если MCP HTTP транспорт недоступен, просто логируем. REST API продолжит работать.
-    logger.warning(f"MCP HTTP transport not enabled: {_mcp_http_err}")
+    logger.error(f"❌ MCP HTTP transport not enabled: {_mcp_http_err}")
+    import traceback
+    logger.error(f"Traceback: {traceback.format_exc()}")
 
 async def make_amocrm_request(endpoint: str, method: str = "GET", data: Dict = None, params: Dict = None):
     """Выполняет запрос к AmoCRM API"""

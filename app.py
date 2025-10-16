@@ -103,7 +103,7 @@ try:
 
     # Создаем транспорт SSE
     security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-    sse_transport = SseServerTransport(endpoint="/mcp/messages", security_settings=security)
+    sse_transport = SseServerTransport(endpoint="/messages", security_settings=security)
 
     # Создаем ASGI приложение которое обрабатывает /mcp/*
     async def mcp_asgi_app(scope, receive, send):

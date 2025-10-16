@@ -111,21 +111,43 @@ try:
         path = scope.get("path", "")
         method = scope.get("method", "GET")
         
-        logger.info(f"📡 MCP ASGI called: {method} {path} (full scope: {scope.keys()})")
+        logger.info(f"📡 MCP ASGI called: {method} {path}")
         
-        # Проверяем различные варианты path
-        if (path == "/sse" or path == "/mcp/sse" or path.endswith("/sse")) and method == "GET":
+        # Обрабатываем базовый путь /mcp/ или / - информация о сервере
+        if (path == "/" or path == "") and method == "GET":
+            logger.info("ℹ️ MCP info request")
+            import json
+            response_data = json.dumps({
+                "name": "AmoCRM MCP Server",
+                "version": "3.0.0",
+                "protocol": "mcp",
+                "endpoints": {
+                    "sse": "/mcp/sse",
+                    "messages": "/mcp/messages"
+                },
+                "status": "ready"
+            }).encode()
+            await send({
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"application/json"]],
+            })
+            await send({
+                "type": "http.response.body",
+                "body": response_data,
+            })
+        # Обрабатываем SSE endpoint
+        elif (path == "/sse" or path == "/mcp/sse" or path.endswith("/sse")) and method == "GET":
             logger.info("🔌 Connecting SSE stream...")
-            # Обрабатываем SSE соединение
             async with sse_transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
                 await mcp_app.run(
                     read_stream,
                     write_stream,
                     mcp_app.create_initialization_options(),
                 )
+        # Обрабатываем POST messages
         elif (path == "/messages" or path == "/mcp/messages" or path.endswith("/messages")) and method == "POST":
             logger.info("📨 Handling POST message...")
-            # Обрабатываем POST сообщение
             await sse_transport.handle_post_message(scope, receive, send)
         else:
             # 404 для неизвестных путей
@@ -137,7 +159,7 @@ try:
             })
             await send({
                 "type": "http.response.body",
-                "body": f"Not Found: {path}. Expected /sse or /messages".encode(),
+                "body": f"Not Found: {path}. Use /mcp/, /mcp/sse or /mcp/messages".encode(),
             })
     
     # Монтируем ASGI приложение

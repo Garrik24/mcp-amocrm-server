@@ -111,9 +111,10 @@ try:
         path = scope.get("path", "")
         method = scope.get("method", "GET")
         
-        logger.info(f"📡 MCP ASGI called: {method} {path}")
+        logger.info(f"📡 MCP ASGI called: {method} {path} (full scope: {scope.keys()})")
         
-        if path == "/sse" and method == "GET":
+        # Проверяем различные варианты path
+        if (path == "/sse" or path == "/mcp/sse" or path.endswith("/sse")) and method == "GET":
             logger.info("🔌 Connecting SSE stream...")
             # Обрабатываем SSE соединение
             async with sse_transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
@@ -122,7 +123,7 @@ try:
                     write_stream,
                     mcp_app.create_initialization_options(),
                 )
-        elif path == "/messages" and method == "POST":
+        elif (path == "/messages" or path == "/mcp/messages" or path.endswith("/messages")) and method == "POST":
             logger.info("📨 Handling POST message...")
             # Обрабатываем POST сообщение
             await sse_transport.handle_post_message(scope, receive, send)

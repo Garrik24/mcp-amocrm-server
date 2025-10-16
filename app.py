@@ -114,7 +114,7 @@ try:
         logger.info(f"📡 MCP ASGI called: {method} {path}")
         
         # Обрабатываем базовый путь /mcp/ или / - информация о сервере
-        if (path == "/" or path == "") and method == "GET":
+        if (path == "/" or path == "" or path == "/mcp/") and method == "GET":
             logger.info("ℹ️ MCP info request")
             import json
             response_data = json.dumps({

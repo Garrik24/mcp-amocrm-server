@@ -512,7 +512,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             )
             
         elif name == "get_contacts":
-            params = {"limit": arguments.get("limit", 50)}
+            params = {"limit": arguments.get("limit", 250)}  # Увеличен до 250
             if "query" in arguments:
                 params["query"] = arguments["query"]
             result = await make_api_request(
@@ -592,13 +592,15 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             
         # ========== СДЕЛКИ ==========
         elif name == "get_leads":
-            params = {"limit": arguments.get("limit", 50)}
+            params = {"limit": arguments.get("limit", 250)}  # Увеличен до 250
             if "query" in arguments:
                 params["query"] = arguments["query"]
             if "status_id" in arguments:
                 params["filter[statuses][0][status_id]"] = arguments["status_id"]
             if "pipeline_id" in arguments:
                 params["filter[statuses][0][pipeline_id]"] = arguments["pipeline_id"]
+            # Добавляем причины потери
+            params["with"] = "loss_reason"
                 
             result = await make_api_request(
                 "/api/entities",
@@ -716,7 +718,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             
         # ========== КОМПАНИИ ==========
         elif name == "get_companies":
-            params = {"limit": arguments.get("limit", 50)}
+            params = {"limit": arguments.get("limit", 250)}  # Увеличен до 250
             if "query" in arguments:
                 params["query"] = arguments["query"]
                 

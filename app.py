@@ -239,6 +239,16 @@ async def receive_webhook(data: WebhookData):
     
     return {"status": "received"}
 
+@app.get("/api/leads/loss-reasons")
+async def get_loss_reasons(authorization: Optional[str] = Header(None)):
+    """Получение списка причин потери сделок"""
+    try:
+        result = await make_amocrm_request("/api/v4/leads/loss_reasons", "GET")
+        return result
+    except Exception as e:
+        logger.error(f"Ошибка получения причин потери: {str(e)}")
+        return {"error": str(e), "status": "error"}
+
 
 @app.get("/api/report/deals")
 async def get_deals_report(
@@ -247,11 +257,14 @@ async def get_deals_report(
     updated_at_from: Optional[int] = Query(None, description="Дата обновления (Unix Timestamp) с которой нужно начать поиск"),
     status_id: Optional[int] = Query(None, description="ID статуса сделки (этапа воронки)"),
     pipeline_id: Optional[int] = Query(None, description="ID воронки продаж"),
+    limit: Optional[int] = Query(250, description="Количество сделок за один запрос (макс 250)"),
+    page: Optional[int] = Query(1, description="Номер страницы для пагинации"),
     authorization: Optional[str] = Header(None)
 ):
     """
     Получение отчета по сделкам.
     Позволяет фильтровать сделки по дате создания, обновления, статусу, воронке и поисковому запросу.
+    Теперь с поддержкой пагинации - можно получить до 250 сделок за раз.
     """
     try:
         # Формируем параметры для AmoCRM API
@@ -269,8 +282,9 @@ async def get_deals_report(
             params["filter[statuses][0][pipeline_id]"] = pipeline_id
         
         # Добавляем дополнительные поля для более подробной информации
-        params["with"] = "contacts,companies"
-        params["limit"] = 50
+        params["with"] = "contacts,companies,loss_reason"
+        params["limit"] = min(limit, 250)  # Максимум 250 (ограничение AmoCRM)
+        params["page"] = page
         
         result = await make_amocrm_request("/api/v4/leads", "GET", params=params)
         

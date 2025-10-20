@@ -311,3 +311,4 @@ curl https://mcp-amocrm-server-production.up.railway.app/
 **Результат:** ✅ ВСЕ СИСТЕМЫ РАБОТАЮТ!  
 **Статус:** 🚀 ГОТОВО К ИСПОЛЬЗОВАНИЮ!
 
+

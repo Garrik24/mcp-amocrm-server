@@ -255,3 +255,4 @@ pip install -r requirements.txt
 tail -f ~/Library/Logs/Claude/mcp*.log
 ```
 
+

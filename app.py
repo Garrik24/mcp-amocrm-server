@@ -307,6 +307,20 @@ async def get_deals_report(
 # Хранилище активных SSE соединений
 active_connections: Dict[str, asyncio.Queue] = {}
 
+@app.get("/mcp")
+async def mcp_root():
+    """Корневой MCP endpoint для проверки доступности"""
+    return {
+        "name": "amocrm-mcp-server",
+        "version": "3.0.0",
+        "protocol": "mcp",
+        "endpoints": {
+            "sse": "/mcp/sse",
+            "messages": "/mcp/messages"
+        },
+        "status": "active"
+    }
+
 @app.get("/mcp/sse")
 async def mcp_sse_endpoint(request: Request):
     """SSE endpoint для ChatGPT MCP Connector"""

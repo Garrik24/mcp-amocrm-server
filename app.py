@@ -1,11 +1,18 @@
-from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi import FastAPI, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List, Union
 import os
 import aiohttp
 import logging
 import time
+import json
+import asyncio
+from dotenv import load_dotenv
+
+# Загрузка переменных окружения из .env файла
+load_dotenv()
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -17,10 +24,10 @@ app = FastAPI(
     version="3.0.0"
 )
 
-# CORS (разрешаем доступ для LLM/браузеров; при проде лучше ограничить домены)
+# Добавляем CORS для ChatGPT
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # В продакшене ограничьте до chatgpt.com
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -73,104 +80,6 @@ async def root():
 async def health_check():
     """Health check для Railway"""
     return {"status": "healthy", "timestamp": int(time.time())}
-
-@app.get("/debug/mcp-status")
-async def mcp_status():
-    """Проверка статуса MCP интеграции"""
-    mcp_enabled = False
-    mcp_error = None
-    
-    try:
-        from mcp_server import app as mcp_app
-        from mcp.server.sse import SseServerTransport
-        mcp_enabled = True
-    except Exception as e:
-        mcp_error = str(e)
-    
-    return {
-        "mcp_enabled": mcp_enabled,
-        "mcp_error": mcp_error,
-        "mcp_endpoint": "/mcp/sse" if mcp_enabled else None,
-        "mcp_version": "1.17.0" if mcp_enabled else None
-    }
-
-# ===================== MCP over HTTP (для ChatGPT Connectors и любых клиентов MCP по сети) =====================
-# Реализуем SSE/POST транспорт MCP по адресу /mcp
-try:
-    # Импортируем наш MCP-сервер (реестр инструментов) и HTTP транспорт из mcp
-    from mcp_server import app as mcp_app
-    from mcp.server.sse import SseServerTransport, TransportSecuritySettings
-
-    # Создаем транспорт SSE
-    security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-    sse_transport = SseServerTransport(endpoint="/messages", security_settings=security)
-
-    # Создаем ASGI приложение которое обрабатывает /mcp/*
-    async def mcp_asgi_app(scope, receive, send):
-        """ASGI middleware для MCP endpoints"""
-        path = scope.get("path", "")
-        method = scope.get("method", "GET")
-        
-        logger.info(f"📡 MCP ASGI called: {method} {path}")
-        
-        # Обрабатываем базовый путь /mcp/ или / - информация о сервере
-        if (path == "/" or path == "" or path == "/mcp/") and method == "GET":
-            logger.info("ℹ️ MCP info request")
-            import json
-            response_data = json.dumps({
-                "name": "AmoCRM MCP Server",
-                "version": "3.0.0",
-                "protocol": "mcp",
-                "endpoints": {
-                    "sse": "/mcp/sse",
-                    "messages": "/mcp/messages"
-                },
-                "status": "ready"
-            }).encode()
-            await send({
-                "type": "http.response.start",
-                "status": 200,
-                "headers": [[b"content-type", b"application/json"]],
-            })
-            await send({
-                "type": "http.response.body",
-                "body": response_data,
-            })
-        # Обрабатываем SSE endpoint
-        elif (path == "/sse" or path == "/mcp/sse" or path.endswith("/sse")) and method == "GET":
-            logger.info("🔌 Connecting SSE stream...")
-            async with sse_transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
-                await mcp_app.run(
-                    read_stream,
-                    write_stream,
-                    mcp_app.create_initialization_options(),
-                )
-        # Обрабатываем POST messages
-        elif (path == "/messages" or path == "/mcp/messages" or path.endswith("/messages")) and method == "POST":
-            logger.info("📨 Handling POST message...")
-            await sse_transport.handle_post_message(scope, receive, send)
-        else:
-            # 404 для неизвестных путей
-            logger.warning(f"❌ Unknown MCP path: {method} {path}")
-            await send({
-                "type": "http.response.start",
-                "status": 404,
-                "headers": [[b"content-type", b"text/plain"]],
-            })
-            await send({
-                "type": "http.response.body",
-                "body": f"Not Found: {path}. Use /mcp/, /mcp/sse or /mcp/messages".encode(),
-            })
-    
-    # Монтируем ASGI приложение
-    app.mount("/mcp", mcp_asgi_app)
-    
-    logger.info("✅ MCP HTTP transport enabled at /mcp/sse and /mcp/messages")
-except Exception as _mcp_http_err:
-    # Если MCP HTTP транспорт недоступен, просто логируем. REST API продолжит работать.
-    logger.error(f"❌ MCP HTTP transport not enabled: {_mcp_http_err}")
-    import traceback
-    logger.error(f"Traceback: {traceback.format_exc()}")
 
 async def make_amocrm_request(endpoint: str, method: str = "GET", data: Dict = None, params: Dict = None):
     """Выполняет запрос к AmoCRM API"""
@@ -393,342 +302,196 @@ async def get_deals_report(
         logger.error(f"Ошибка получения отчета по сделкам: {str(e)}")
         return {"error": str(e), "status": "error"}
 
+# ========== MCP ENDPOINTS ДЛЯ CHATGPT CONNECTORS ==========
 
-@app.get("/api/contacts/search")
-async def search_contacts(
-    query: str = Query(..., description="Email, телефон или имя для поиска"),
-    limit: int = Query(10, description="Количество результатов"),
-    authorization: Optional[str] = Header(None)
-):
-    """
-    Поиск контактов по email, телефону или имени.
-    Возвращает список найденных контактов с полной информацией.
-    """
-    try:
-        result = await make_amocrm_request(
-            "/api/v4/contacts",
-            "GET",
-            params={"query": query, "limit": limit, "with": "leads"}
-        )
-        return result
-    except Exception as e:
-        logger.error(f"Ошибка поиска контактов: {str(e)}")
-        return {"error": str(e), "status": "error"}
+# Хранилище активных SSE соединений
+active_connections: Dict[str, asyncio.Queue] = {}
 
-
-@app.post("/api/contacts/check-exists")
-async def check_contact_exists(
-    query: str = Query(..., description="Email или телефон для проверки"),
-    authorization: Optional[str] = Header(None)
-):
-    """
-    Проверка существования контакта по email или телефону.
-    Возвращает информацию о наличии контакта и его ID если найден.
-    """
-    try:
-        result = await make_amocrm_request(
-            "/api/v4/contacts",
-            "GET",
-            params={"query": query, "limit": 1}
-        )
+@app.get("/mcp/sse")
+async def mcp_sse_endpoint(request: Request):
+    """SSE endpoint для ChatGPT MCP Connector"""
+    async def event_generator():
+        # Создаем уникальный ID для соединения
+        connection_id = str(time.time())
+        queue = asyncio.Queue()
+        active_connections[connection_id] = queue
         
-        exists = False
-        contact_id = None
-        contact_data = None
+        logger.info(f"MCP SSE: Новое подключение {connection_id}")
         
-        if "_embedded" in result and "contacts" in result["_embedded"]:
-            contacts = result["_embedded"]["contacts"]
-            if len(contacts) > 0:
-                exists = True
-                contact_id = contacts[0]["id"]
-                contact_data = contacts[0]
-        
-        return {
-            "exists": exists,
-            "contact_id": contact_id,
-            "contact": contact_data,
-            "query": query
-        }
-    except Exception as e:
-        logger.error(f"Ошибка проверки контакта: {str(e)}")
-        return {"error": str(e), "status": "error"}
-
-
-@app.post("/api/contacts/get-or-create")
-async def get_or_create_contact(request: Dict[str, Any]):
-    """
-    Получить контакт если существует, или создать новый.
-    Умная операция: сначала ищет по query, если не находит - создает.
-    
-    Body:
-    {
-        "query": "email или телефон",
-        "name": "Имя контакта",
-        "email": "email@example.com",
-        "phone": "+79991234567"
-    }
-    """
-    try:
-        query = request.get("query")
-        if not query:
-            return {"error": "Параметр query обязателен", "status": "error"}
-        
-        # Ищем контакт
-        search_result = await make_amocrm_request(
-            "/api/v4/contacts",
-            "GET",
-            params={"query": query, "limit": 1}
-        )
-        
-        if "_embedded" in search_result and "contacts" in search_result["_embedded"]:
-            contacts = search_result["_embedded"]["contacts"]
-            if len(contacts) > 0:
-                return {
-                    "found": True,
-                    "created": False,
-                    "contact": contacts[0]
+        try:
+            # Отправляем приветственное сообщение
+            init_message = {
+                "jsonrpc": "2.0",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": {
+                        "name": "amocrm-mcp-server",
+                        "version": "3.0.0"
+                    }
                 }
-        
-        # Создаем новый контакт
-        contact_data = {
-            "name": request.get("name", "Новый контакт")
-        }
-        
-        custom_fields = []
-        if "email" in request:
-            custom_fields.append({
-                "field_code": "EMAIL",
-                "values": [{"value": request["email"], "enum_code": "WORK"}]
-            })
-        if "phone" in request:
-            custom_fields.append({
-                "field_code": "PHONE",
-                "values": [{"value": request["phone"], "enum_code": "WORK"}]
-            })
-        
-        if custom_fields:
-            contact_data["custom_fields_values"] = custom_fields
-        
-        create_result = await make_amocrm_request(
-            "/api/v4/contacts",
-            "POST",
-            data=[contact_data]
-        )
-        
-        return {
-            "found": False,
-            "created": True,
-            "contact": create_result
-        }
-        
-    except Exception as e:
-        logger.error(f"Ошибка get_or_create_contact: {str(e)}")
-        return {"error": str(e), "status": "error"}
-
-
-@app.post("/api/leads/create-with-contact")
-async def create_lead_with_contact(request: Dict[str, Any]):
-    """
-    Создание сделки с контактом (комплексное создание).
-    Если contact_id указан - связывает с существующим контактом.
-    Если нет - создает новый контакт вместе со сделкой.
-    
-    Body:
-    {
-        "lead_name": "Название сделки",
-        "lead_price": 10000,
-        "contact_id": 123456,  // опционально, если есть
-        "contact_name": "Имя контакта",  // если создаем новый
-        "contact_email": "email@example.com",
-        "contact_phone": "+79991234567"
-    }
-    """
-    try:
-        lead_data = {
-            "name": request.get("lead_name", "Новая сделка")
-        }
-        
-        if "lead_price" in request:
-            lead_data["price"] = request["lead_price"]
-        
-        # Если указан ID существующего контакта
-        if "contact_id" in request:
-            lead_data["_embedded"] = {
-                "contacts": [{"id": request["contact_id"]}]
             }
+            yield f"data: {json.dumps(init_message)}\n\n"
+            
+            # Держим соединение открытым
+            while True:
+                if await request.is_disconnected():
+                    logger.info(f"MCP SSE: Клиент отключился {connection_id}")
+                    break
+                    
+                try:
+                    # Ждем сообщения из очереди с таймаутом
+                    message = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield f"data: {json.dumps(message)}\n\n"
+                except asyncio.TimeoutError:
+                    # Отправляем keep-alive каждые 30 секунд
+                    yield f": keep-alive\n\n"
+                    
+        except Exception as e:
+            logger.error(f"MCP SSE ошибка: {str(e)}")
+        finally:
+            # Очищаем соединение
+            if connection_id in active_connections:
+                del active_connections[connection_id]
+            logger.info(f"MCP SSE: Соединение закрыто {connection_id}")
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+@app.post("/mcp/messages")
+async def mcp_messages_endpoint(request: Request):
+    """Endpoint для обработки MCP сообщений от ChatGPT"""
+    try:
+        body = await request.json()
+        logger.info(f"MCP Message: {body}")
+        
+        # Обрабатываем запрос в зависимости от метода
+        method = body.get("method")
+        params = body.get("params", {})
+        
+        if method == "tools/list":
+            # Возвращаем список доступных инструментов
+            return {
+                "jsonrpc": "2.0",
+                "id": body.get("id"),
+                "result": {
+                    "tools": [
+                        {
+                            "name": "get_account",
+                            "description": "Получить информацию об аккаунте AmoCRM",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {}
+                            }
+                        },
+                        {
+                            "name": "search_contacts",
+                            "description": "Поиск контактов по email или телефону",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {
+                                        "type": "string",
+                                        "description": "Email, телефон или имя для поиска"
+                                    }
+                                },
+                                "required": ["query"]
+                            }
+                        },
+                        {
+                            "name": "create_lead",
+                            "description": "Создать сделку в AmoCRM",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {
+                                        "type": "string",
+                                        "description": "Название сделки"
+                                    },
+                                    "price": {
+                                        "type": "number",
+                                        "description": "Бюджет сделки"
+                                    }
+                                },
+                                "required": ["name"]
+                            }
+                        }
+                    ]
+                }
+            }
+        
+        elif method == "tools/call":
+            # Вызов конкретного инструмента
+            tool_name = params.get("name")
+            tool_args = params.get("arguments", {})
+            
+            result = None
+            
+            if tool_name == "get_account":
+                result = await make_amocrm_request("/api/v4/account")
+            
+            elif tool_name == "search_contacts":
+                result = await make_amocrm_request(
+                    "/api/v4/contacts",
+                    "GET",
+                    params={"query": tool_args.get("query"), "limit": 10}
+                )
+            
+            elif tool_name == "create_lead":
+                lead_data = [{
+                    "name": tool_args.get("name"),
+                    "price": tool_args.get("price", 0)
+                }]
+                result = await make_amocrm_request(
+                    "/api/v4/leads",
+                    "POST",
+                    data=lead_data
+                )
+            
+            return {
+                "jsonrpc": "2.0",
+                "id": body.get("id"),
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, ensure_ascii=False, indent=2)
+                        }
+                    ]
+                }
+            }
+        
         else:
-            # Создаем контакт вместе со сделкой
-            contact_data = {
-                "name": request.get("contact_name", "Новый контакт")
+            # Неизвестный метод
+            return {
+                "jsonrpc": "2.0",
+                "id": body.get("id"),
+                "error": {
+                    "code": -32601,
+                    "message": f"Method not found: {method}"
+                }
             }
             
-            custom_fields = []
-            if "contact_email" in request:
-                custom_fields.append({
-                    "field_code": "EMAIL",
-                    "values": [{"value": request["contact_email"], "enum_code": "WORK"}]
-                })
-            if "contact_phone" in request:
-                custom_fields.append({
-                    "field_code": "PHONE",
-                    "values": [{"value": request["contact_phone"], "enum_code": "WORK"}]
-                })
-            
-            if custom_fields:
-                contact_data["custom_fields_values"] = custom_fields
-            
-            lead_data["_embedded"] = {
-                "contacts": [contact_data]
-            }
-        
-        # Используем complex endpoint для создания
-        result = await make_amocrm_request(
-            "/api/v4/leads/complex",
-            "POST",
-            data=[lead_data]
-        )
-        
-        return result
-        
     except Exception as e:
-        logger.error(f"Ошибка создания сделки с контактом: {str(e)}")
-        return {"error": str(e), "status": "error"}
-
-
-@app.post("/api/smart/client-and-lead")
-async def smart_create_client_and_lead(request: Dict[str, Any]):
-    """
-    УМНОЕ создание: полный цикл работы с клиентом и сделкой.
-    
-    Алгоритм:
-    1. Проверяет существование контакта по email/телефону
-    2. Если не существует - создает контакт
-    3. Проверяет есть ли у контакта открытые сделки
-    4. Если нет - создает новую сделку
-    
-    Body:
-    {
-        "contact_query": "email или телефон",
-        "contact_name": "Имя контакта",
-        "contact_email": "email@example.com",
-        "contact_phone": "+79991234567",
-        "lead_name": "Название сделки",
-        "lead_price": 10000,
-        "check_existing_leads": true  // проверять ли наличие сделок
-    }
-    """
-    try:
-        query = request.get("contact_query")
-        if not query:
-            return {"error": "Параметр contact_query обязателен", "status": "error"}
-        
-        steps = []
-        
-        # Шаг 1: Проверяем контакт
-        steps.append("Проверка существования контакта...")
-        search_result = await make_amocrm_request(
-            "/api/v4/contacts",
-            "GET",
-            params={"query": query, "limit": 1, "with": "leads"}
-        )
-        
-        contact_id = None
-        contact_exists = False
-        
-        if "_embedded" in search_result and "contacts" in search_result["_embedded"]:
-            contacts = search_result["_embedded"]["contacts"]
-            if len(contacts) > 0:
-                contact_exists = True
-                contact_id = contacts[0]["id"]
-                steps.append(f"✓ Контакт найден (ID: {contact_id})")
-        
-        # Шаг 2: Создаем контакт если не существует
-        if not contact_exists:
-            steps.append("Создание нового контакта...")
-            contact_data = {
-                "name": request.get("contact_name", "Новый контакт")
-            }
-            
-            custom_fields = []
-            if "contact_email" in request:
-                custom_fields.append({
-                    "field_code": "EMAIL",
-                    "values": [{"value": request["contact_email"], "enum_code": "WORK"}]
-                })
-            if "contact_phone" in request:
-                custom_fields.append({
-                    "field_code": "PHONE",
-                    "values": [{"value": request["contact_phone"], "enum_code": "WORK"}]
-                })
-            
-            if custom_fields:
-                contact_data["custom_fields_values"] = custom_fields
-            
-            create_result = await make_amocrm_request(
-                "/api/v4/contacts",
-                "POST",
-                data=[contact_data]
-            )
-            
-            if "_embedded" in create_result and "contacts" in create_result["_embedded"]:
-                contact_id = create_result["_embedded"]["contacts"][0]["id"]
-                steps.append(f"✓ Контакт создан (ID: {contact_id})")
-        
-        # Шаг 3: Проверяем существующие сделки если нужно
-        should_create_lead = True
-        if request.get("check_existing_leads", True) and contact_id:
-            steps.append("Проверка существующих сделок...")
-            leads_result = await make_amocrm_request(
-                "/api/v4/leads",
-                "GET",
-                params={
-                    "filter[contacts][0]": contact_id,
-                    "limit": 1
-                }
-            )
-            
-            if "_embedded" in leads_result and "leads" in leads_result["_embedded"]:
-                leads = leads_result["_embedded"]["leads"]
-                if len(leads) > 0:
-                    should_create_lead = False
-                    steps.append(f"! У контакта уже есть сделки ({len(leads)} шт.)")
-        
-        # Шаг 4: Создаем сделку
-        lead_result = None
-        if should_create_lead and contact_id:
-            steps.append("Создание сделки...")
-            lead_data = {
-                "name": request.get("lead_name", "Новая сделка"),
-                "_embedded": {
-                    "contacts": [{"id": contact_id}]
-                }
-            }
-            
-            if "lead_price" in request:
-                lead_data["price"] = request["lead_price"]
-            
-            lead_result = await make_amocrm_request(
-                "/api/v4/leads",
-                "POST",
-                data=[lead_data]
-            )
-            
-            if "_embedded" in lead_result and "leads" in lead_result["_embedded"]:
-                lead_id = lead_result["_embedded"]["leads"][0]["id"]
-                steps.append(f"✓ Сделка создана (ID: {lead_id})")
-        
+        logger.error(f"MCP Messages ошибка: {str(e)}")
         return {
-            "success": True,
-            "steps": steps,
-            "contact_id": contact_id,
-            "contact_was_created": not contact_exists,
-            "lead_was_created": should_create_lead,
-            "lead_result": lead_result
+            "jsonrpc": "2.0",
+            "id": body.get("id", None),
+            "error": {
+                "code": -32603,
+                "message": str(e)
+            }
         }
-        
-    except Exception as e:
-        logger.error(f"Ошибка smart_create_client_and_lead: {str(e)}")
-        return {"error": str(e), "status": "error", "steps": steps}
 
 if __name__ == "__main__":
     import uvicorn

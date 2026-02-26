@@ -10,6 +10,7 @@ import logging
 import time
 import json
 import asyncio
+from urllib.parse import quote
 from dotenv import load_dotenv
 
 # Загрузка переменных окружения из .env файла
@@ -89,15 +90,28 @@ async def health_check():
 
 def build_url_with_params(base_url: str, params: Dict = None) -> str:
     """
-    Строит URL с query-параметрами БЕЗ URL-кодирования скобок.
-    aiohttp кодирует [] как %5B%5D, что amoCRM не понимает.
+    Строит URL с query-параметрами:
+    - сохраняет [] в ключах (filter[type][])
+    - безопасно кодирует значения
+    - поддерживает повторяющиеся ключи через list
     """
     if not params:
         return base_url
+
     parts = []
     for key, value in params.items():
-        if value is not None:
-            parts.append(f"{key}={value}")
+        if value is None:
+            continue
+
+        safe_key = quote(str(key), safe="[]")
+        if isinstance(value, list):
+            for item in value:
+                if item is None:
+                    continue
+                parts.append(f"{safe_key}={quote(str(item), safe='')}")
+        else:
+            parts.append(f"{safe_key}={quote(str(value), safe='')}")
+
     if parts:
         return f"{base_url}?{'&'.join(parts)}"
     return base_url
@@ -281,6 +295,7 @@ async def get_loss_reasons(authorization: Optional[str] = Header(None)):
 
 @app.get("/api/events")
 async def get_events(
+    request: Request,
     type: Optional[str] = Query(None, description="Тип события: incoming_mail_message, outgoing_mail_message, incoming_call, outgoing_call, incoming_chat_message"),
     date_from: Optional[str] = Query(None, description="Начало периода (ISO или unix timestamp)"),
     date_to: Optional[str] = Query(None, description="Конец периода (ISO или unix timestamp)"),
@@ -291,11 +306,22 @@ async def get_events(
     """Получение событий из amoCRM (почта, звонки, чаты)"""
     try:
         params = {}
+        type_values: List[str] = []
+
         if type:
-            # Поддержка нескольких типов через запятую
-            types = [t.strip() for t in type.split(",")]
-            for i, t in enumerate(types):
-                params[f"filter[type][{i}]"] = t
+            type_values.extend([t.strip() for t in type.split(",") if t.strip()])
+
+        # Поддержка формата amoCRM filter[type][]=...
+        type_values.extend([v for v in request.query_params.getlist("filter[type][]") if v])
+
+        # Поддержка индексированного формата filter[type][0]=...
+        for key, value in request.query_params.multi_items():
+            if key.startswith("filter[type][") and key.endswith("]") and value:
+                type_values.append(value)
+
+        if type_values:
+            params["filter[type][]"] = type_values
+
         if date_from:
             # Если пришла ISO дата, конвертируем в unix timestamp
             try:

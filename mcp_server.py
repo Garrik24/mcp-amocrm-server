@@ -8,6 +8,7 @@ import sys
 import os
 import asyncio
 import aiohttp
+import yarl
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 from mcp.server.models import InitializationOptions
@@ -50,16 +51,31 @@ def _to_unix(ts_value) -> int:
     except Exception:
         raise ValueError(f"Неверный формат даты/времени: {ts_value}")
 
+def _build_url(base: str, params: Dict[str, Any] = None) -> str:
+    """Строит URL с query-параметрами БЕЗ кодирования скобок [].
+    aiohttp кодирует [] → %5B%5D, а amoCRM и наш бэкенд ожидают сырые скобки.
+    """
+    if not params:
+        return base
+    parts = []
+    for key, value in params.items():
+        if value is not None:
+            parts.append(f"{key}={value}")
+    if parts:
+        return f"{base}?{'&'.join(parts)}"
+    return base
+
 async def make_request(method: str, endpoint: str, data: Dict[str, Any] = None, params: Dict[str, Any] = None) -> Dict[str, Any]:
     """Выполняет HTTP запрос к AmoCRM серверу"""
-    url = f"{AMOCRM_SERVER_URL}{endpoint}"
-    
+    # Строим URL вручную, чтобы скобки [] не кодировались aiohttp
+    url = _build_url(f"{AMOCRM_SERVER_URL}{endpoint}", params if method.upper() == "GET" else None)
+
     # Позволяем отключить проверку SSL (например, при нестабильных сертификатах)
     verify_ssl = os.getenv("AMO_SSL_VERIFY", "true").lower() not in {"0", "false", "no"}
     connector = aiohttp.TCPConnector(ssl=False) if not verify_ssl else None
     async with aiohttp.ClientSession(connector=connector) as session:
         if method.upper() == "GET":
-            async with session.get(url, params=params) as response:
+            async with session.get(yarl.URL(url, encoded=True)) as response:
                 return await response.json()
         elif method.upper() == "POST":
             async with session.post(url, json=data) as response:

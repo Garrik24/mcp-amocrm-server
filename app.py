@@ -281,7 +281,8 @@ async def get_loss_reasons(authorization: Optional[str] = Header(None)):
 
 @app.get("/api/events")
 async def get_events(
-    type: Optional[str] = Query(None, description="Тип события: incoming_mail_message, outgoing_mail_message, incoming_call, outgoing_call, incoming_chat_message"),
+    request: Request,
+    type: Optional[str] = Query(None, description="Тип события: incoming_mail, outgoing_mail, incoming_call, outgoing_call, incoming_chat_message, outgoing_chat_message, incoming_sms, outgoing_sms, lead_added, lead_status_changed, task_added, task_completed, common_note_added. Несколько типов через запятую."),
     date_from: Optional[str] = Query(None, description="Начало периода (ISO или unix timestamp)"),
     date_to: Optional[str] = Query(None, description="Конец периода (ISO или unix timestamp)"),
     limit: Optional[int] = Query(50, description="Количество записей (по умолчанию 50)"),
@@ -291,31 +292,54 @@ async def get_events(
     """Получение событий из amoCRM (почта, звонки, чаты)"""
     try:
         params = {}
+
+        # --- Приоритет 1: именованный параметр type ---
         if type:
             # Поддержка нескольких типов через запятую
-            types = [t.strip() for t in type.split(",")]
-            for i, t in enumerate(types):
+            types_list = [t.strip() for t in type.split(",")]
+            for i, t in enumerate(types_list):
                 params[f"filter[type][{i}]"] = t
+
+        # --- Приоритет 2: сырые filter[*] параметры из query string ---
+        # Это покрывает случай когда MCP/LLM отправляет filter[type][]=... напрямую
+        raw_qp = dict(request.query_params)
+        has_raw_type_filter = any(k.startswith("filter[type]") for k in raw_qp)
+        if not type and has_raw_type_filter:
+            for k, v in raw_qp.items():
+                if k.startswith("filter[type]"):
+                    # Нормализуем ключи: filter[type][] → filter[type][0], filter[type][1] и т.д.
+                    if k == "filter[type][]":
+                        params["filter[type][0]"] = v
+                    else:
+                        params[k] = v
+            logger.info(f"Events: подхвачены сырые filter[type] параметры из query string: {params}")
+
+        # Прокидываем любые другие filter[*] параметры (created_at, entity и т.д.)
+        for k, v in raw_qp.items():
+            if k.startswith("filter[") and not k.startswith("filter[type]"):
+                params[k] = v
+
         if date_from:
             # Если пришла ISO дата, конвертируем в unix timestamp
             try:
                 ts = int(date_from)
             except ValueError:
-                from datetime import datetime
-                dt = datetime.fromisoformat(date_from.replace("Z", "+00:00"))
+                from datetime import datetime as _dt
+                dt = _dt.fromisoformat(date_from.replace("Z", "+00:00"))
                 ts = int(dt.timestamp())
             params["filter[created_at][from]"] = ts
         if date_to:
             try:
                 ts = int(date_to)
             except ValueError:
-                from datetime import datetime
-                dt = datetime.fromisoformat(date_to.replace("Z", "+00:00"))
+                from datetime import datetime as _dt
+                dt = _dt.fromisoformat(date_to.replace("Z", "+00:00"))
                 ts = int(dt.timestamp())
             params["filter[created_at][to]"] = ts
         params["limit"] = min(limit, 100)
         params["page"] = page
 
+        logger.info(f"Events: финальные params для amoCRM: {params}")
         result = await make_amocrm_request("/api/v4/events", "GET", params=params)
         return result
     except Exception as e:
@@ -419,8 +443,8 @@ async def get_notes(
 async def proxy_amocrm_v4(path: str, request: Request, authorization: Optional[str] = Header(None)):
     """
     Прямой прокси к amoCRM API v4.
-    Пример: GET /api/v4-proxy/events?filter[type][]=incoming_mail_message
-    проксируется в GET https://stavgeo26.amocrm.ru/api/v4/events?filter[type][]=incoming_mail_message
+    Пример: GET /api/v4-proxy/events?filter[type][]=incoming_mail
+    проксируется в GET https://stavgeo26.amocrm.ru/api/v4/events?filter[type][]=incoming_mail
     """
     try:
         endpoint = f"/api/v4/{path}"
@@ -653,7 +677,7 @@ async def mcp_messages_endpoint(request: Request):
                                 "properties": {
                                     "type": {
                                         "type": "string",
-                                        "description": "Тип события: incoming_mail_message, outgoing_mail_message, incoming_call, outgoing_call, incoming_chat_message. Можно несколько через запятую."
+                                        "description": "Тип события: incoming_mail, outgoing_mail, incoming_call, outgoing_call, incoming_chat_message, outgoing_chat_message, incoming_sms, outgoing_sms, lead_added, lead_status_changed, task_added, task_completed, common_note_added. Несколько типов через запятую."
                                     },
                                     "date_from": {
                                         "type": "string",
@@ -792,7 +816,7 @@ async def mcp_messages_endpoint(request: Request):
                                     },
                                     "params": {
                                         "type": "object",
-                                        "description": "Query-параметры запроса. Например: {\"filter[type][]\": \"incoming_mail_message\", \"limit\": 5}"
+                                        "description": "Query-параметры запроса. Например: {\"filter[type][]\": \"incoming_mail\", \"limit\": 5}"
                                     },
                                     "body": {
                                         "type": "object",

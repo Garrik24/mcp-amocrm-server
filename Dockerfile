@@ -11,8 +11,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Копируем код приложения
 COPY . .
 
-# Открываем порт
-EXPOSE 8000
+# Railway назначает порт через переменную $PORT
+ENV PORT=8000
+EXPOSE ${PORT}
 
-# Команда запуска
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Команда запуска — используем shell form для подстановки $PORT
+CMD uvicorn app:app --host 0.0.0.0 --port ${PORT}

@@ -13,6 +13,7 @@ import asyncio
 import uuid
 from urllib.parse import quote
 from dotenv import load_dotenv
+import chat_storage
 
 # Загрузка переменных окружения из .env файла
 load_dotenv()
@@ -80,7 +81,12 @@ async def root():
             "contacts": "/api/contacts",
             "notes": "/api/notes/{entity_type}/{entity_id}",
             "v4_proxy": "/api/v4-proxy/{path}",
-            "webhooks": "/webhooks/receive"
+            "webhooks": "/webhooks/receive",
+            "chat_by_lead": "/api/chat/lead/{lead_id}",
+            "chat_by_contact": "/api/chat/contact/{contact_id}",
+            "chat_recent": "/api/chat/recent",
+            "chat_search": "/api/chat/search?q=текст",
+            "chat_stats": "/api/chat/stats"
         }
     }
 
@@ -272,14 +278,26 @@ async def get_custom_fields(entity_type: str, authorization: Optional[str] = Hea
         return {"error": str(e), "status": "error"}
 
 @app.post("/webhooks/receive")
-async def receive_webhook(data: WebhookData):
-    """Приём вебхуков от AmoCRM"""
-    logger.info(f"Получен вебхук: {data}")
-    
-    # Здесь можно добавить обработку вебхуков
-    # Например, сохранение в БД, отправка уведомлений и т.д.
-    
-    return {"status": "received"}
+async def receive_webhook(request: Request):
+    """Приём вебхуков от AmoCRM — включая чат-сообщения."""
+    try:
+        try:
+            payload = await request.json()
+        except Exception:
+            form = await request.form()
+            payload = {k: v for k, v in form.items()}
+
+        logger.info(f"Webhook: {json.dumps(payload, ensure_ascii=False, default=str)[:500]}")
+
+        messages = chat_storage.parse_webhook_messages(payload)
+        saved = sum(1 for msg in messages if chat_storage.save_message(msg))
+        for msg in messages:
+            logger.info(f"💬 {msg.get('origin')} | {msg.get('author_name')}: {msg.get('text', '')[:80]}")
+
+        return {"status": "received", "chat_messages_saved": saved}
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return {"status": "error", "detail": str(e)}
 
 @app.get("/api/leads/loss-reasons")
 async def get_loss_reasons(authorization: Optional[str] = Header(None)):
@@ -535,6 +553,38 @@ async def get_deals_report(
         return {"error": str(e), "status": "error"}
 
 
+# ========== ЧАТ-СООБЩЕНИЯ (webhook-based storage) ==========
+
+@app.get("/api/chat/lead/{lead_id}")
+async def chat_by_lead(lead_id: int, limit: int = 50, offset: int = 0):
+    """Сообщения чатов по ID сделки."""
+    msgs = chat_storage.get_messages_by_lead(lead_id, limit, offset)
+    return {"lead_id": lead_id, "count": len(msgs), "messages": msgs, "formatted": chat_storage.format_chat_history(msgs)}
+
+@app.get("/api/chat/contact/{contact_id}")
+async def chat_by_contact(contact_id: int, limit: int = 50, offset: int = 0):
+    """Сообщения чатов по ID контакта."""
+    msgs = chat_storage.get_messages_by_contact(contact_id, limit, offset)
+    return {"contact_id": contact_id, "count": len(msgs), "messages": msgs, "formatted": chat_storage.format_chat_history(msgs)}
+
+@app.get("/api/chat/recent")
+async def chat_recent(limit: int = 20):
+    """Последние сообщения из всех каналов."""
+    msgs = chat_storage.get_recent_messages(limit)
+    return {"count": len(msgs), "messages": msgs, "formatted": chat_storage.format_chat_history(msgs)}
+
+@app.get("/api/chat/search")
+async def chat_search(q: str = Query("", description="Текст для поиска"), limit: int = 20):
+    """Поиск по тексту чат-сообщений."""
+    msgs = chat_storage.search_messages(q, limit)
+    return {"query": q, "count": len(msgs), "messages": msgs, "formatted": chat_storage.format_chat_history(msgs)}
+
+@app.get("/api/chat/stats")
+async def chat_stats():
+    """Статистика по чат-сообщениям."""
+    return chat_storage.get_stats()
+
+
 # ========================================================================
 # MCP SSE TRANSPORT (spec: https://spec.modelcontextprotocol.io/specification/2024-11-05/basic/transports/#sse)
 # ========================================================================
@@ -740,6 +790,45 @@ MCP_TOOLS = [
             },
             "required": ["method", "path"]
         }
+    },
+    {
+        "name": "get_chat_messages",
+        "description": "Получить историю чат-сообщений (Авито, WhatsApp, Telegram) по ID сделки.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "lead_id": {"type": "integer", "description": "ID сделки"},
+                "limit": {"type": "integer", "default": 50}
+            },
+            "required": ["lead_id"]
+        }
+    },
+    {
+        "name": "get_recent_chats",
+        "description": "Последние чат-сообщения из всех каналов.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 20}
+            }
+        }
+    },
+    {
+        "name": "search_chat_messages",
+        "description": "Поиск по тексту чат-сообщений.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 20}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "get_chat_stats",
+        "description": "Статистика по чат-сообщениям: всего, за сегодня, по каналам.",
+        "inputSchema": {"type": "object", "properties": {}}
     }
 ]
 
@@ -1106,6 +1195,23 @@ async def _execute_tool(tool_name: str, tool_args: dict) -> dict:
                 data=data,
                 params=req_params if req_method == "GET" else None
             )
+
+    # Чат-тулы
+    if tool_name == "get_chat_messages":
+        lead_id = tool_args["lead_id"]
+        msgs = chat_storage.get_messages_by_lead(lead_id, tool_args.get("limit", 50))
+        return {"lead_id": lead_id, "count": len(msgs), "formatted": chat_storage.format_chat_history(msgs), "messages": msgs} if msgs else {"lead_id": lead_id, "count": 0, "note": "Сообщений не найдено"}
+
+    if tool_name == "get_recent_chats":
+        msgs = chat_storage.get_recent_messages(tool_args.get("limit", 20))
+        return {"count": len(msgs), "formatted": chat_storage.format_chat_history(msgs), "messages": msgs}
+
+    if tool_name == "search_chat_messages":
+        msgs = chat_storage.search_messages(tool_args["query"], tool_args.get("limit", 20))
+        return {"query": tool_args["query"], "count": len(msgs), "formatted": chat_storage.format_chat_history(msgs), "messages": msgs}
+
+    if tool_name == "get_chat_stats":
+        return chat_storage.get_stats()
 
     return {"error": f"Unknown tool: {tool_name}"}
 

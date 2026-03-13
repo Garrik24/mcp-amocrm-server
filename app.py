@@ -10,6 +10,7 @@ import logging
 import time
 import json
 import asyncio
+import uuid
 from urllib.parse import quote
 from dotenv import load_dotenv
 
@@ -533,10 +534,215 @@ async def get_deals_report(
         logger.error(f"Ошибка получения отчета по сделкам: {str(e)}")
         return {"error": str(e), "status": "error"}
 
-# ========== MCP ENDPOINTS ДЛЯ CHATGPT CONNECTORS ==========
 
-# Хранилище активных SSE соединений
-active_connections: Dict[str, asyncio.Queue] = {}
+# ========================================================================
+# MCP SSE TRANSPORT (spec: https://spec.modelcontextprotocol.io/specification/2024-11-05/basic/transports/#sse)
+# ========================================================================
+
+# Хранилище активных SSE-сессий: session_id -> asyncio.Queue
+mcp_sessions: Dict[str, asyncio.Queue] = {}
+
+# Список MCP-инструментов (tools)
+MCP_TOOLS = [
+    {
+        "name": "get_account",
+        "description": "Получить информацию об аккаунте AmoCRM",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "search_contacts",
+        "description": "Поиск контактов по email или телефону",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Email, телефон или имя для поиска"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "create_lead",
+        "description": "Создать сделку в AmoCRM",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Название сделки"
+                },
+                "price": {
+                    "type": "number",
+                    "description": "Бюджет сделки"
+                }
+            },
+            "required": ["name"]
+        }
+    },
+    {
+        "name": "get_events",
+        "description": "Получить события из amoCRM (почта, звонки, чаты). Используйте для сводки входящей/исходящей почты, звонков и сообщений.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "description": "Тип события: incoming_mail_message, outgoing_mail_message, incoming_call, outgoing_call, incoming_chat_message. Можно несколько через запятую."
+                },
+                "date_from": {
+                    "type": "string",
+                    "description": "Начало периода (ISO дата или unix timestamp)"
+                },
+                "date_to": {
+                    "type": "string",
+                    "description": "Конец периода (ISO дата или unix timestamp)"
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Количество записей (по умолчанию 50)",
+                    "default": 50
+                }
+            }
+        }
+    },
+    {
+        "name": "get_tasks",
+        "description": "Получить список задач из amoCRM. Используйте для показа задач на день, невыполненных задач, задач конкретного пользователя.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "is_completed": {
+                    "type": "number",
+                    "description": "0 — не выполнены, 1 — выполнены. Если не указано — все задачи."
+                },
+                "responsible_user_id": {
+                    "type": "number",
+                    "description": "ID ответственного пользователя"
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Количество задач (по умолчанию 50)",
+                    "default": 50
+                }
+            }
+        }
+    },
+    {
+        "name": "create_task",
+        "description": "Создать задачу в amoCRM. Привязывается к сделке или контакту.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Текст задачи"
+                },
+                "complete_till": {
+                    "type": "number",
+                    "description": "Срок выполнения (Unix timestamp)"
+                },
+                "entity_id": {
+                    "type": "number",
+                    "description": "ID сделки или контакта"
+                },
+                "entity_type": {
+                    "type": "string",
+                    "description": "Тип сущности: leads или contacts",
+                    "enum": ["leads", "contacts"]
+                },
+                "task_type_id": {
+                    "type": "number",
+                    "description": "Тип задачи (1 — Связаться, 2 — Встреча). По умолчанию 1."
+                },
+                "responsible_user_id": {
+                    "type": "number",
+                    "description": "ID ответственного"
+                }
+            },
+            "required": ["text", "complete_till", "entity_id", "entity_type"]
+        }
+    },
+    {
+        "name": "get_contacts",
+        "description": "Получить контакты из amoCRM с поиском по имени, телефону или email. Может подтянуть связанные сделки.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Поисковый запрос (имя, телефон, email)"
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Количество контактов (по умолчанию 50)",
+                    "default": 50
+                },
+                "with_leads": {
+                    "type": "boolean",
+                    "description": "Подтянуть связанные сделки (true/false)",
+                    "default": False
+                }
+            }
+        }
+    },
+    {
+        "name": "get_notes",
+        "description": "Получить примечания (notes) к сделке, контакту или компании. Используйте для чтения истории переписки и комментариев.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entity_type": {
+                    "type": "string",
+                    "description": "Тип сущности: leads, contacts или companies",
+                    "enum": ["leads", "contacts", "companies"]
+                },
+                "entity_id": {
+                    "type": "number",
+                    "description": "ID сущности"
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Количество примечаний (по умолчанию 50)",
+                    "default": 50
+                }
+            },
+            "required": ["entity_type", "entity_id"]
+        }
+    },
+    {
+        "name": "amocrm_request",
+        "description": "Универсальный запрос к amoCRM API v4. Используйте для любого endpoint amoCRM, который не покрыт другими инструментами. Все params передаются напрямую в query string запроса к amoCRM.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "method": {
+                    "type": "string",
+                    "description": "HTTP метод: GET, POST, PATCH, DELETE",
+                    "enum": ["GET", "POST", "PATCH", "DELETE"]
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Путь к API amoCRM, например: /api/v4/events, /api/v4/tasks, /api/v4/contacts"
+                },
+                "params": {
+                    "type": "object",
+                    "description": "Query-параметры запроса. Например: {\"filter[type][]\": \"incoming_mail_message\", \"limit\": 5}"
+                },
+                "body": {
+                    "type": "object",
+                    "description": "JSON тело запроса для POST/PATCH"
+                }
+            },
+            "required": ["method", "path"]
+        }
+    }
+]
+
 
 @app.get("/mcp")
 async def mcp_root():
@@ -552,23 +758,87 @@ async def mcp_root():
         "status": "active"
     }
 
+
 @app.get("/mcp/sse")
 async def mcp_sse_endpoint(request: Request):
-    """SSE endpoint для ChatGPT MCP Connector"""
+    """
+    MCP SSE Transport endpoint.
+    По спецификации MCP:
+    1. Клиент подключается к /mcp/sse (GET, SSE stream)
+    2. Сервер ПЕРВЫМ сообщением шлёт: event: endpoint\\ndata: /mcp/messages?sessionId=<uuid>
+    3. Клиент отправляет JSON-RPC запросы POST на /mcp/messages?sessionId=<uuid>
+    4. Сервер отвечает через SSE-стрим (event: message\\ndata: {...})
+    """
+    session_id = str(uuid.uuid4())
+    queue = asyncio.Queue()
+    mcp_sessions[session_id] = queue
+
+    logger.info(f"MCP SSE: Новое подключение, sessionId={session_id}")
+
     async def event_generator():
-        # Создаем уникальный ID для соединения
-        connection_id = str(time.time())
-        queue = asyncio.Queue()
-        active_connections[connection_id] = queue
-        
-        logger.info(f"MCP SSE: Новое подключение {connection_id}")
-        
         try:
-            # Отправляем приветственное сообщение
-            init_message = {
+            # ШАГ 1: Отправляем endpoint — это ОБЯЗАТЕЛЬНОЕ первое сообщение по спецификации MCP
+            yield f"event: endpoint\ndata: /mcp/messages?sessionId={session_id}\n\n"
+
+            # ШАГ 2: Держим соединение открытым, слушаем очередь ответов
+            while True:
+                if await request.is_disconnected():
+                    logger.info(f"MCP SSE: Клиент отключился, sessionId={session_id}")
+                    break
+
+                try:
+                    message = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield f"event: message\ndata: {json.dumps(message, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    # Keep-alive comment (не event, просто комментарий SSE)
+                    yield ": keep-alive\n\n"
+
+        except asyncio.CancelledError:
+            logger.info(f"MCP SSE: Соединение отменено, sessionId={session_id}")
+        except Exception as e:
+            logger.error(f"MCP SSE ошибка: {str(e)}")
+        finally:
+            mcp_sessions.pop(session_id, None)
+            logger.info(f"MCP SSE: Соединение закрыто, sessionId={session_id}")
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/mcp/messages")
+async def mcp_messages_endpoint(request: Request, sessionId: str = Query(...)):
+    """
+    MCP JSON-RPC messages endpoint.
+    Клиент отправляет сюда JSON-RPC запросы, ответ кладётся в SSE-очередь сессии.
+    Также возвращаем ответ в теле HTTP-ответа (для совместимости).
+    """
+    queue = mcp_sessions.get(sessionId)
+    if not queue:
+        raise HTTPException(status_code=400, detail=f"Unknown session: {sessionId}")
+
+    try:
+        body = await request.json()
+        logger.info(f"MCP Message (session={sessionId}): method={body.get('method')}")
+
+        method = body.get("method")
+        params = body.get("params", {})
+        msg_id = body.get("id")
+
+        response = None
+
+        # ---- initialize ----
+        if method == "initialize":
+            response = {
                 "jsonrpc": "2.0",
-                "method": "initialize",
-                "params": {
+                "id": msg_id,
+                "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {
                         "tools": {}
@@ -579,459 +849,30 @@ async def mcp_sse_endpoint(request: Request):
                     }
                 }
             }
-            yield f"data: {json.dumps(init_message)}\n\n"
-            
-            # Держим соединение открытым
-            while True:
-                if await request.is_disconnected():
-                    logger.info(f"MCP SSE: Клиент отключился {connection_id}")
-                    break
-                    
-                try:
-                    # Ждем сообщения из очереди с таймаутом
-                    message = await asyncio.wait_for(queue.get(), timeout=30.0)
-                    yield f"data: {json.dumps(message)}\n\n"
-                except asyncio.TimeoutError:
-                    # Отправляем keep-alive каждые 30 секунд
-                    yield f": keep-alive\n\n"
-                    
-        except Exception as e:
-            logger.error(f"MCP SSE ошибка: {str(e)}")
-        finally:
-            # Очищаем соединение
-            if connection_id in active_connections:
-                del active_connections[connection_id]
-            logger.info(f"MCP SSE: Соединение закрыто {connection_id}")
-    
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
-    )
 
-@app.post("/mcp/messages")
-async def mcp_messages_endpoint(request: Request):
-    """Endpoint для обработки MCP сообщений от ChatGPT"""
-    try:
-        body = await request.json()
-        logger.info(f"MCP Message: {body}")
-        
-        # Обрабатываем запрос в зависимости от метода
-        method = body.get("method")
-        params = body.get("params", {})
-        
-        if method == "tools/list":
-            # Возвращаем список доступных инструментов
-            return {
+        # ---- notifications/initialized ----
+        elif method == "notifications/initialized":
+            # Это нотификация, не требует ответа
+            return {"jsonrpc": "2.0"}
+
+        # ---- tools/list ----
+        elif method == "tools/list":
+            response = {
                 "jsonrpc": "2.0",
-                "id": body.get("id"),
+                "id": msg_id,
                 "result": {
-                    "tools": [
-                        {
-                            "name": "get_account",
-                            "description": "Получить информацию об аккаунте AmoCRM",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {}
-                            }
-                        },
-                        {
-                            "name": "search_contacts",
-                            "description": "Поиск контактов по email или телефону",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "query": {
-                                        "type": "string",
-                                        "description": "Email, телефон или имя для поиска"
-                                    }
-                                },
-                                "required": ["query"]
-                            }
-                        },
-                        {
-                            "name": "create_lead",
-                            "description": "Создать сделку в AmoCRM",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "name": {
-                                        "type": "string",
-                                        "description": "Название сделки"
-                                    },
-                                    "price": {
-                                        "type": "number",
-                                        "description": "Бюджет сделки"
-                                    }
-                                },
-                                "required": ["name"]
-                            }
-                        },
-                        {
-                            "name": "get_events",
-                            "description": "Получить события из amoCRM (почта, звонки, чаты). Используйте для сводки входящей/исходящей почты, звонков и сообщений.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "type": {
-                                        "type": "string",
-                                        "description": "Тип события: incoming_mail_message, outgoing_mail_message, incoming_call, outgoing_call, incoming_chat_message. Можно несколько через запятую."
-                                    },
-                                    "date_from": {
-                                        "type": "string",
-                                        "description": "Начало периода (ISO дата или unix timestamp)"
-                                    },
-                                    "date_to": {
-                                        "type": "string",
-                                        "description": "Конец периода (ISO дата или unix timestamp)"
-                                    },
-                                    "limit": {
-                                        "type": "number",
-                                        "description": "Количество записей (по умолчанию 50)",
-                                        "default": 50
-                                    }
-                                }
-                            }
-                        },
-                        {
-                            "name": "get_tasks",
-                            "description": "Получить список задач из amoCRM. Используйте для показа задач на день, невыполненных задач, задач конкретного пользователя.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "is_completed": {
-                                        "type": "number",
-                                        "description": "0 — не выполнены, 1 — выполнены. Если не указано — все задачи."
-                                    },
-                                    "responsible_user_id": {
-                                        "type": "number",
-                                        "description": "ID ответственного пользователя"
-                                    },
-                                    "limit": {
-                                        "type": "number",
-                                        "description": "Количество задач (по умолчанию 50)",
-                                        "default": 50
-                                    }
-                                }
-                            }
-                        },
-                        {
-                            "name": "create_task",
-                            "description": "Создать задачу в amoCRM. Привязывается к сделке или контакту.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "text": {
-                                        "type": "string",
-                                        "description": "Текст задачи"
-                                    },
-                                    "complete_till": {
-                                        "type": "number",
-                                        "description": "Срок выполнения (Unix timestamp)"
-                                    },
-                                    "entity_id": {
-                                        "type": "number",
-                                        "description": "ID сделки или контакта"
-                                    },
-                                    "entity_type": {
-                                        "type": "string",
-                                        "description": "Тип сущности: leads или contacts",
-                                        "enum": ["leads", "contacts"]
-                                    },
-                                    "task_type_id": {
-                                        "type": "number",
-                                        "description": "Тип задачи (1 — Связаться, 2 — Встреча). По умолчанию 1."
-                                    },
-                                    "responsible_user_id": {
-                                        "type": "number",
-                                        "description": "ID ответственного"
-                                    }
-                                },
-                                "required": ["text", "complete_till", "entity_id", "entity_type"]
-                            }
-                        },
-                        {
-                            "name": "get_contacts",
-                            "description": "Получить контакты из amoCRM с поиском по имени, телефону или email. Может подтянуть связанные сделки.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "query": {
-                                        "type": "string",
-                                        "description": "Поисковый запрос (имя, телефон, email)"
-                                    },
-                                    "limit": {
-                                        "type": "number",
-                                        "description": "Количество контактов (по умолчанию 50)",
-                                        "default": 50
-                                    },
-                                    "with_leads": {
-                                        "type": "boolean",
-                                        "description": "Подтянуть связанные сделки (true/false)",
-                                        "default": False
-                                    }
-                                }
-                            }
-                        },
-                        {
-                            "name": "get_notes",
-                            "description": "Получить примечания (notes) к сделке, контакту или компании. Используйте для чтения истории переписки и комментариев.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "entity_type": {
-                                        "type": "string",
-                                        "description": "Тип сущности: leads, contacts или companies",
-                                        "enum": ["leads", "contacts", "companies"]
-                                    },
-                                    "entity_id": {
-                                        "type": "number",
-                                        "description": "ID сущности"
-                                    },
-                                    "limit": {
-                                        "type": "number",
-                                        "description": "Количество примечаний (по умолчанию 50)",
-                                        "default": 50
-                                    }
-                                },
-                                "required": ["entity_type", "entity_id"]
-                            }
-                        },
-                        {
-                            "name": "amocrm_request",
-                            "description": "Универсальный запрос к amoCRM API v4. Используйте для любого endpoint amoCRM, который не покрыт другими инструментами. Все params передаются напрямую в query string запроса к amoCRM.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "method": {
-                                        "type": "string",
-                                        "description": "HTTP метод: GET, POST, PATCH, DELETE",
-                                        "enum": ["GET", "POST", "PATCH", "DELETE"]
-                                    },
-                                    "path": {
-                                        "type": "string",
-                                        "description": "Путь к API amoCRM, например: /api/v4/events, /api/v4/tasks, /api/v4/contacts"
-                                    },
-                                    "params": {
-                                        "type": "object",
-                                        "description": "Query-параметры запроса. Например: {\"filter[type][]\": \"incoming_mail_message\", \"limit\": 5}"
-                                    },
-                                    "body": {
-                                        "type": "object",
-                                        "description": "JSON тело запроса для POST/PATCH"
-                                    }
-                                },
-                                "required": ["method", "path"]
-                            }
-                        }
-                    ]
+                    "tools": MCP_TOOLS
                 }
             }
-        
+
+        # ---- tools/call ----
         elif method == "tools/call":
-            # Вызов конкретного инструмента
             tool_name = params.get("name")
             tool_args = params.get("arguments", {})
-            
-            result = None
-            
-            if tool_name == "get_account":
-                result = await make_amocrm_request("/api/v4/account")
-            
-            elif tool_name == "search_contacts":
-                result = await make_amocrm_request(
-                    "/api/v4/contacts",
-                    "GET",
-                    params={"query": tool_args.get("query"), "limit": 10}
-                )
-            
-            elif tool_name == "create_lead":
-                lead_data = [{
-                    "name": tool_args.get("name"),
-                    "price": tool_args.get("price", 0)
-                }]
-                result = await make_amocrm_request(
-                    "/api/v4/leads",
-                    "POST",
-                    data=lead_data
-                )
-
-            elif tool_name == "get_events":
-                params = {}
-                event_type = tool_args.get("type")
-                if event_type:
-                    types = [t.strip() for t in event_type.split(",")]
-                    for i, t in enumerate(types):
-                        params[f"filter[type][{i}]"] = t
-                date_from = tool_args.get("date_from")
-                if date_from:
-                    try:
-                        ts = int(date_from)
-                    except (ValueError, TypeError):
-                        from datetime import datetime as dt_cls
-                        d = dt_cls.fromisoformat(str(date_from).replace("Z", "+00:00"))
-                        ts = int(d.timestamp())
-                    params["filter[created_at][from]"] = ts
-                date_to = tool_args.get("date_to")
-                if date_to:
-                    try:
-                        ts = int(date_to)
-                    except (ValueError, TypeError):
-                        from datetime import datetime as dt_cls
-                        d = dt_cls.fromisoformat(str(date_to).replace("Z", "+00:00"))
-                        ts = int(d.timestamp())
-                    params["filter[created_at][to]"] = ts
-                params["limit"] = tool_args.get("limit", 50)
-                result = await make_amocrm_request("/api/v4/events", "GET", params=params)
-
-            elif tool_name == "get_tasks":
-                params = {"limit": tool_args.get("limit", 50)}
-                if "is_completed" in tool_args and tool_args["is_completed"] is not None:
-                    params["filter[is_completed]"] = tool_args["is_completed"]
-                if tool_args.get("responsible_user_id"):
-                    params["filter[responsible_user_id]"] = tool_args["responsible_user_id"]
-                result = await make_amocrm_request("/api/v4/tasks", "GET", params=params)
-
-            elif tool_name == "create_task":
-                task_data = [{
-                    "text": tool_args["text"],
-                    "complete_till": tool_args["complete_till"],
-                    "entity_id": tool_args["entity_id"],
-                    "entity_type": tool_args["entity_type"],
-                    "task_type_id": tool_args.get("task_type_id", 1),
-                }]
-                if tool_args.get("responsible_user_id"):
-                    task_data[0]["responsible_user_id"] = tool_args["responsible_user_id"]
-                result = await make_amocrm_request("/api/v4/tasks", "POST", data=task_data)
-
-            elif tool_name == "get_contacts":
-                params = {"limit": tool_args.get("limit", 50)}
-                if tool_args.get("query"):
-                    params["query"] = tool_args["query"]
-                if tool_args.get("with_leads"):
-                    params["with"] = "leads"
-                result = await make_amocrm_request("/api/v4/contacts", "GET", params=params)
-
-            elif tool_name == "get_notes":
-                entity_type = tool_args["entity_type"]
-                entity_id = tool_args["entity_id"]
-                params = {"limit": tool_args.get("limit", 50)}
-                result = await make_amocrm_request(
-                    f"/api/v4/{entity_type}/{entity_id}/notes",
-                    "GET",
-                    params=params
-                )
-
-            elif tool_name == "amocrm_request":
-                req_method = tool_args.get("method", "GET").upper()
-                req_path = tool_args.get("path", "").rstrip("/")
-                req_params = tool_args.get("params", {})
-                req_body = tool_args.get("body")
-
-                # Нормализуем путь для сравнения
-                norm_path = req_path
-                if norm_path.startswith("/api/v4/"):
-                    norm_path = "/api/" + norm_path[8:]
-                elif not norm_path.startswith("/api/"):
-                    norm_path = "/api/" + norm_path.lstrip("/")
-
-                # Роутинг через внутреннюю логику для известных эндпоинтов
-                # чтобы упрощённые параметры (type, is_completed, query)
-                # правильно транслировались в формат amoCRM (filter[type][] и т.д.)
-                if norm_path == "/api/events" and req_method == "GET":
-                    ev_params = {}
-                    event_type = req_params.get("type")
-                    if event_type:
-                        types = [t.strip() for t in str(event_type).split(",")]
-                        for i, t in enumerate(types):
-                            ev_params[f"filter[type][{i}]"] = t
-                    date_from = req_params.get("date_from")
-                    if date_from:
-                        try:
-                            ts = int(date_from)
-                        except (ValueError, TypeError):
-                            from datetime import datetime as dt_cls
-                            d = dt_cls.fromisoformat(str(date_from).replace("Z", "+00:00"))
-                            ts = int(d.timestamp())
-                        ev_params["filter[created_at][from]"] = ts
-                    date_to = req_params.get("date_to")
-                    if date_to:
-                        try:
-                            ts = int(date_to)
-                        except (ValueError, TypeError):
-                            from datetime import datetime as dt_cls
-                            d = dt_cls.fromisoformat(str(date_to).replace("Z", "+00:00"))
-                            ts = int(d.timestamp())
-                        ev_params["filter[created_at][to]"] = ts
-                    ev_params["limit"] = req_params.get("limit", 50)
-                    ev_params["page"] = req_params.get("page", 1)
-                    # Прокидываем любые filter[*] параметры напрямую
-                    for k, v in req_params.items():
-                        if k.startswith("filter["):
-                            ev_params[k] = v
-                    result = await make_amocrm_request("/api/v4/events", "GET", params=ev_params)
-
-                elif norm_path == "/api/tasks" and req_method == "GET":
-                    t_params = {
-                        "limit": req_params.get("limit", 50),
-                        "page": req_params.get("page", 1)
-                    }
-                    if "is_completed" in req_params and req_params["is_completed"] is not None:
-                        t_params["filter[is_completed]"] = req_params["is_completed"]
-                    if req_params.get("responsible_user_id"):
-                        t_params["filter[responsible_user_id]"] = req_params["responsible_user_id"]
-                    for k, v in req_params.items():
-                        if k.startswith("filter["):
-                            t_params[k] = v
-                    result = await make_amocrm_request("/api/v4/tasks", "GET", params=t_params)
-
-                elif norm_path == "/api/contacts" and req_method == "GET":
-                    c_params = {
-                        "limit": req_params.get("limit", 50),
-                        "page": req_params.get("page", 1)
-                    }
-                    if req_params.get("query"):
-                        c_params["query"] = req_params["query"]
-                    if req_params.get("with_leads"):
-                        c_params["with"] = "leads"
-                    if req_params.get("with"):
-                        c_params["with"] = req_params["with"]
-                    for k, v in req_params.items():
-                        if k.startswith("filter["):
-                            c_params[k] = v
-                    result = await make_amocrm_request("/api/v4/contacts", "GET", params=c_params)
-
-                else:
-                    # Универсальный passthrough к amoCRM API v4
-                    if not req_path.startswith("/api/v4"):
-                        if req_path.startswith("/api/"):
-                            req_path = "/api/v4/" + req_path[5:]
-                        elif req_path.startswith("/"):
-                            req_path = "/api/v4" + req_path
-                        else:
-                            req_path = "/api/v4/" + req_path
-
-                    data = None
-                    if req_method in ("POST", "PATCH") and req_body:
-                        data = req_body if isinstance(req_body, list) else [req_body]
-
-                    result = await make_amocrm_request(
-                        req_path,
-                        req_method,
-                        data=data,
-                        params=req_params if req_method == "GET" else None
-                    )
-
-            if result is None:
-                result = {"error": f"Unknown tool: {tool_name}"}
-
-            return {
+            result = await _execute_tool(tool_name, tool_args)
+            response = {
                 "jsonrpc": "2.0",
-                "id": body.get("id"),
+                "id": msg_id,
                 "result": {
                     "content": [
                         {
@@ -1041,30 +882,234 @@ async def mcp_messages_endpoint(request: Request):
                     ]
                 }
             }
-        
-        else:
-            # Неизвестный метод
-            return {
+
+        # ---- ping ----
+        elif method == "ping":
+            response = {
                 "jsonrpc": "2.0",
-                "id": body.get("id"),
+                "id": msg_id,
+                "result": {}
+            }
+
+        # ---- unknown method ----
+        else:
+            response = {
+                "jsonrpc": "2.0",
+                "id": msg_id,
                 "error": {
                     "code": -32601,
                     "message": f"Method not found: {method}"
                 }
             }
-            
+
+        # Кладём ответ в SSE-очередь, чтобы клиент получил через стрим
+        if response and msg_id is not None:
+            await queue.put(response)
+
+        # Также возвращаем в HTTP-теле (Claude использует и то, и другое)
+        return response or {"jsonrpc": "2.0"}
+
     except Exception as e:
         logger.error(f"MCP Messages ошибка: {str(e)}")
-        return {
+        error_resp = {
             "jsonrpc": "2.0",
-            "id": body.get("id", None),
+            "id": body.get("id") if 'body' in dir() else None,
             "error": {
                 "code": -32603,
                 "message": str(e)
             }
         }
+        if queue:
+            await queue.put(error_resp)
+        return error_resp
+
+
+async def _execute_tool(tool_name: str, tool_args: dict) -> dict:
+    """Выполнить MCP-инструмент и вернуть результат."""
+
+    if tool_name == "get_account":
+        return await make_amocrm_request("/api/v4/account")
+
+    elif tool_name == "search_contacts":
+        return await make_amocrm_request(
+            "/api/v4/contacts",
+            "GET",
+            params={"query": tool_args.get("query"), "limit": 10}
+        )
+
+    elif tool_name == "create_lead":
+        lead_data = [{
+            "name": tool_args.get("name"),
+            "price": tool_args.get("price", 0)
+        }]
+        return await make_amocrm_request("/api/v4/leads", "POST", data=lead_data)
+
+    elif tool_name == "get_events":
+        params = {}
+        event_type = tool_args.get("type")
+        if event_type:
+            types = [t.strip() for t in event_type.split(",")]
+            for i, t in enumerate(types):
+                params[f"filter[type][{i}]"] = t
+        date_from = tool_args.get("date_from")
+        if date_from:
+            try:
+                ts = int(date_from)
+            except (ValueError, TypeError):
+                from datetime import datetime as dt_cls
+                d = dt_cls.fromisoformat(str(date_from).replace("Z", "+00:00"))
+                ts = int(d.timestamp())
+            params["filter[created_at][from]"] = ts
+        date_to = tool_args.get("date_to")
+        if date_to:
+            try:
+                ts = int(date_to)
+            except (ValueError, TypeError):
+                from datetime import datetime as dt_cls
+                d = dt_cls.fromisoformat(str(date_to).replace("Z", "+00:00"))
+                ts = int(d.timestamp())
+            params["filter[created_at][to]"] = ts
+        params["limit"] = tool_args.get("limit", 50)
+        return await make_amocrm_request("/api/v4/events", "GET", params=params)
+
+    elif tool_name == "get_tasks":
+        params = {"limit": tool_args.get("limit", 50)}
+        if "is_completed" in tool_args and tool_args["is_completed"] is not None:
+            params["filter[is_completed]"] = tool_args["is_completed"]
+        if tool_args.get("responsible_user_id"):
+            params["filter[responsible_user_id]"] = tool_args["responsible_user_id"]
+        return await make_amocrm_request("/api/v4/tasks", "GET", params=params)
+
+    elif tool_name == "create_task":
+        task_data = [{
+            "text": tool_args["text"],
+            "complete_till": tool_args["complete_till"],
+            "entity_id": tool_args["entity_id"],
+            "entity_type": tool_args["entity_type"],
+            "task_type_id": tool_args.get("task_type_id", 1),
+        }]
+        if tool_args.get("responsible_user_id"):
+            task_data[0]["responsible_user_id"] = tool_args["responsible_user_id"]
+        return await make_amocrm_request("/api/v4/tasks", "POST", data=task_data)
+
+    elif tool_name == "get_contacts":
+        params = {"limit": tool_args.get("limit", 50)}
+        if tool_args.get("query"):
+            params["query"] = tool_args["query"]
+        if tool_args.get("with_leads"):
+            params["with"] = "leads"
+        return await make_amocrm_request("/api/v4/contacts", "GET", params=params)
+
+    elif tool_name == "get_notes":
+        entity_type = tool_args["entity_type"]
+        entity_id = tool_args["entity_id"]
+        params = {"limit": tool_args.get("limit", 50)}
+        return await make_amocrm_request(
+            f"/api/v4/{entity_type}/{entity_id}/notes",
+            "GET",
+            params=params
+        )
+
+    elif tool_name == "amocrm_request":
+        req_method = tool_args.get("method", "GET").upper()
+        req_path = tool_args.get("path", "").rstrip("/")
+        req_params = tool_args.get("params", {})
+        req_body = tool_args.get("body")
+
+        # Нормализуем путь
+        norm_path = req_path
+        if norm_path.startswith("/api/v4/"):
+            norm_path = "/api/" + norm_path[8:]
+        elif not norm_path.startswith("/api/"):
+            norm_path = "/api/" + norm_path.lstrip("/")
+
+        # Роутинг через внутреннюю логику для известных эндпоинтов
+        if norm_path == "/api/events" and req_method == "GET":
+            ev_params = {}
+            event_type = req_params.get("type")
+            if event_type:
+                types = [t.strip() for t in str(event_type).split(",")]
+                for i, t in enumerate(types):
+                    ev_params[f"filter[type][{i}]"] = t
+            date_from = req_params.get("date_from")
+            if date_from:
+                try:
+                    ts = int(date_from)
+                except (ValueError, TypeError):
+                    from datetime import datetime as dt_cls
+                    d = dt_cls.fromisoformat(str(date_from).replace("Z", "+00:00"))
+                    ts = int(d.timestamp())
+                ev_params["filter[created_at][from]"] = ts
+            date_to = req_params.get("date_to")
+            if date_to:
+                try:
+                    ts = int(date_to)
+                except (ValueError, TypeError):
+                    from datetime import datetime as dt_cls
+                    d = dt_cls.fromisoformat(str(date_to).replace("Z", "+00:00"))
+                    ts = int(d.timestamp())
+                ev_params["filter[created_at][to]"] = ts
+            ev_params["limit"] = req_params.get("limit", 50)
+            ev_params["page"] = req_params.get("page", 1)
+            for k, v in req_params.items():
+                if k.startswith("filter["):
+                    ev_params[k] = v
+            return await make_amocrm_request("/api/v4/events", "GET", params=ev_params)
+
+        elif norm_path == "/api/tasks" and req_method == "GET":
+            t_params = {
+                "limit": req_params.get("limit", 50),
+                "page": req_params.get("page", 1)
+            }
+            if "is_completed" in req_params and req_params["is_completed"] is not None:
+                t_params["filter[is_completed]"] = req_params["is_completed"]
+            if req_params.get("responsible_user_id"):
+                t_params["filter[responsible_user_id]"] = req_params["responsible_user_id"]
+            for k, v in req_params.items():
+                if k.startswith("filter["):
+                    t_params[k] = v
+            return await make_amocrm_request("/api/v4/tasks", "GET", params=t_params)
+
+        elif norm_path == "/api/contacts" and req_method == "GET":
+            c_params = {
+                "limit": req_params.get("limit", 50),
+                "page": req_params.get("page", 1)
+            }
+            if req_params.get("query"):
+                c_params["query"] = req_params["query"]
+            if req_params.get("with_leads"):
+                c_params["with"] = "leads"
+            if req_params.get("with"):
+                c_params["with"] = req_params["with"]
+            for k, v in req_params.items():
+                if k.startswith("filter["):
+                    c_params[k] = v
+            return await make_amocrm_request("/api/v4/contacts", "GET", params=c_params)
+
+        else:
+            # Универсальный passthrough
+            if not req_path.startswith("/api/v4"):
+                if req_path.startswith("/api/"):
+                    req_path = "/api/v4/" + req_path[5:]
+                elif req_path.startswith("/"):
+                    req_path = "/api/v4" + req_path
+                else:
+                    req_path = "/api/v4/" + req_path
+
+            data = None
+            if req_method in ("POST", "PATCH") and req_body:
+                data = req_body if isinstance(req_body, list) else [req_body]
+
+            return await make_amocrm_request(
+                req_path,
+                req_method,
+                data=data,
+                params=req_params if req_method == "GET" else None
+            )
+
+    return {"error": f"Unknown tool: {tool_name}"}
+
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-

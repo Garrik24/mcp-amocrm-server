@@ -4,6 +4,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List, Union
 import os
+import re
 import aiohttp
 import yarl
 import logging
@@ -11,7 +12,7 @@ import time
 import json
 import asyncio
 import uuid
-from urllib.parse import quote
+from urllib.parse import quote, parse_qsl
 from dotenv import load_dotenv
 import chat_storage
 
@@ -277,22 +278,91 @@ async def get_custom_fields(entity_type: str, authorization: Optional[str] = Hea
         logger.error(f"Ошибка получения полей: {str(e)}")
         return {"error": str(e), "status": "error"}
 
+# Кеш talk_id -> (lead_id|None, expires_at). Кешируем и негативный результат,
+# чтобы talk без лида (или временная ошибка REST) не дёргал amoCRM на каждое сообщение.
+_talk_lead_cache: Dict[str, tuple] = {}
+_TALK_CACHE_TTL_OK = 24 * 3600   # успешный резолв talk->lead держим долго
+_TALK_CACHE_TTL_MISS = 300       # не-лид / ошибка REST — короткий TTL, чтобы потом повторить
+_TALK_CACHE_MAX = 10000          # потолок против неограниченного роста
+
+
+async def _resolve_lead_id_by_talk(talk_id) -> Optional[int]:
+    """Надёжно резолвит lead_id по talk_id через amoCRM (talk_id есть в каждом вебхуке).
+
+    Кеширует и положительный, и отрицательный результат с TTL; запрос с таймаутом,
+    чтобы зависший amoCRM не блокировал обработку вебхука.
+    """
+    try:
+        tid = int(talk_id)
+    except (ValueError, TypeError):
+        return None
+
+    key = str(tid)
+    now = time.time()
+    cached = _talk_lead_cache.get(key)
+    if cached and cached[1] > now:
+        return cached[0]
+
+    lead_id: Optional[int] = None
+    ttl = _TALK_CACHE_TTL_MISS
+    try:
+        res = await asyncio.wait_for(
+            make_amocrm_request(f"/api/v4/talks/{tid}", "GET"), timeout=8
+        )
+        if isinstance(res, dict) and res.get("entity_type") == "lead" and res.get("entity_id"):
+            lead_id = int(res["entity_id"])
+            ttl = _TALK_CACHE_TTL_OK
+    except Exception as e:
+        logger.warning(f"Не удалось резолвить lead по talk {tid}: {e}")
+
+    if len(_talk_lead_cache) > _TALK_CACHE_MAX:
+        _talk_lead_cache.clear()
+    _talk_lead_cache[key] = (lead_id, now + ttl)
+    return lead_id
+
+
 @app.post("/webhooks/receive")
 async def receive_webhook(request: Request):
-    """Приём вебхуков от AmoCRM — включая чат-сообщения."""
-    try:
-        try:
-            payload = await request.json()
-        except Exception:
-            form = await request.form()
-            payload = {k: v for k, v in form.items()}
+    """Приём вебхуков от AmoCRM — включая чат-сообщения.
 
-        logger.info(f"Webhook: {json.dumps(payload, ensure_ascii=False, default=str)[:500]}")
+    amoCRM шлёт application/x-www-form-urlencoded со скобочными ключами
+    (message[add][0][text]=...). Разворачиваем их во вложенную структуру.
+    """
+    try:
+        raw = await request.body()
+        text = raw.decode("utf-8", "replace")
+        ctype = request.headers.get("content-type", "")
+
+        if "application/json" in ctype or text.lstrip().startswith("{"):
+            try:
+                payload = json.loads(text or "{}")
+            except Exception:
+                payload = {}
+        else:
+            # urldecode + сохранение порядка; скобочные ключи развернёт parser
+            payload = dict(parse_qsl(text, keep_blank_values=True))
+
+        # Логируем только ИМЕНА ключей (структуру), без значений — не сливаем перс.данные
+        # клиентов в логи Railway, но видим состав полей вебхука (author/origin/element_*).
+        logger.info(f"Webhook keys: {sorted(payload.keys())[:80]}")
 
         messages = chat_storage.parse_webhook_messages(payload)
+
+        # Дозаполняем lead_id через talk_id, если вебхук его не дал напрямую
+        for msg in messages:
+            if not msg.get("lead_id") and msg.get("talk_id"):
+                lead_id = await _resolve_lead_id_by_talk(msg.get("talk_id"))
+                if lead_id:
+                    msg["lead_id"] = lead_id
+
         saved = sum(1 for msg in messages if chat_storage.save_message(msg))
         for msg in messages:
-            logger.info(f"💬 {msg.get('origin')} | {msg.get('author_name')}: {msg.get('text', '')[:80]}")
+            # метаданные без текста/имени — диагностика привязки без утечки перс.данных
+            logger.info(
+                f"💬 {msg.get('origin')} | msg={msg.get('message_id')} talk={msg.get('talk_id')} "
+                f"lead={msg.get('lead_id')} contact={msg.get('contact_id')} in={msg.get('is_incoming')} "
+                f"len={len(str(msg.get('text') or ''))}"
+            )
 
         return {"status": "received", "chat_messages_saved": saved}
     except Exception as e:
@@ -1186,8 +1256,17 @@ async def _execute_tool(tool_name: str, tool_args: dict) -> dict:
                     req_path = "/api/v4/" + req_path
 
             data = None
-            if req_method in ("POST", "PATCH") and req_body:
-                data = req_body if isinstance(req_body, list) else [req_body]
+            if req_method in ("POST", "PATCH") and req_body is not None:
+                if isinstance(req_body, list):
+                    # Уже массив — батч-эндпоинт
+                    data = req_body
+                elif re.search(r"/\d+$", req_path):
+                    # Одиночный эндпоинт /api/v4/leads/{id} — amoCRM ждёт объект.
+                    # Оборачивание в массив здесь даёт молчаливый no-op (200 без изменений).
+                    data = req_body
+                else:
+                    # Батч-эндпоинт /api/v4/leads — amoCRM ждёт массив объектов
+                    data = [req_body]
 
             return await make_amocrm_request(
                 req_path,

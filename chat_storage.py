@@ -5,6 +5,7 @@ SQLite-хранилище для message[add] событий.
 
 import sqlite3
 import os
+import re
 import json
 import time
 from datetime import datetime, timezone, timedelta
@@ -46,60 +47,137 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
+def _coerce_lists(node):
+    """Превращает dict с последовательными числовыми ключами 0..n в list (рекурсивно)."""
+    if isinstance(node, dict):
+        node = {k: _coerce_lists(v) for k, v in node.items()}
+        keys = list(node.keys())
+        if keys and all(isinstance(k, str) and k.isdigit() for k in keys):
+            idxs = sorted(int(k) for k in keys)
+            if idxs == list(range(len(idxs))):
+                return [node[str(i)] for i in idxs]
+        return node
+    if isinstance(node, list):
+        return [_coerce_lists(v) for v in node]
+    return node
+
+
+def unflatten(flat: dict) -> dict:
+    """PHP-стиль form-ключи amoCRM (a[b][0][c]=v) -> вложенная структура.
+
+    amoCRM шлёт вебхуки как application/x-www-form-urlencoded со скобочными
+    ключами вида `message[add][0][text]`. После urldecode это плоский словарь,
+    который нужно развернуть во вложенную структуру и нормализовать индексы в списки.
+    """
+    root: dict = {}
+    key_re = re.compile(r"\[([^\]]*)\]")
+    for full_key, value in flat.items():
+        full_key = str(full_key)
+        head = re.match(r"^([^\[]+)", full_key)
+        if not head:
+            continue
+        tokens = [head.group(1)] + key_re.findall(full_key)
+        cur = root
+        for i, tok in enumerate(tokens):
+            if i == len(tokens) - 1:
+                cur[tok] = value
+            else:
+                nxt = cur.get(tok)
+                if not isinstance(nxt, dict):
+                    nxt = {}
+                    cur[tok] = nxt
+                cur = nxt
+    return _coerce_lists(root)
+
+
 def parse_webhook_messages(payload: dict) -> list[dict]:
-    """Парсинг webhook от amoCRM — извлечение message[add] событий."""
-    messages = []
-    msg_add = None
+    """Парсинг webhook от amoCRM — извлечение message[add] событий.
 
-    if isinstance(payload, dict):
-        msg_data = payload.get("message", {})
-        if isinstance(msg_data, dict):
-            msg_add = msg_data.get("add")
+    Принимает как плоский словарь скобочных form-ключей (формат amoCRM),
+    так и уже вложенную JSON-структуру.
+    """
+    messages: list[dict] = []
 
-    if not msg_add or not isinstance(msg_add, list):
+    if not isinstance(payload, dict):
+        return messages
+
+    # Если пришли плоские скобочные ключи — разворачиваем
+    if any("[" in str(k) for k in payload.keys()):
+        payload = unflatten(payload)
+
+    msg_data = payload.get("message")
+    msg_add = msg_data.get("add") if isinstance(msg_data, dict) else None
+    if isinstance(msg_add, dict):
+        # dict здесь — это либо одиночное сообщение без индекса (message[add][id]=...),
+        # либо разреженные/непоследовательные индексы (_coerce_lists их не свернул в list).
+        if msg_add and all(str(k).isdigit() for k in msg_add.keys()):
+            msg_add = [msg_add[k] for k in sorted(msg_add.keys(), key=lambda x: int(x))]
+        else:
+            msg_add = [msg_add]
+    if not isinstance(msg_add, list):
         return messages
 
     for item in msg_add:
-        author = item.get("author", {}) or {}
-        attachment = item.get("attachment", {}) or {}
+        if not isinstance(item, dict):
+            continue
+        # Без message_id сообщение не дедуплицируется (UNIQUE допускает много NULL)
+        # и засоряет БД через публичный эндпоинт — пропускаем.
+        if not item.get("id"):
+            continue
+        author = item.get("author") or {}
+        if not isinstance(author, dict):
+            author = {}
+        attachment = item.get("attachment") or {}
+        if not isinstance(attachment, dict):
+            attachment = {}
 
-        # element_type: "1" = lead, "2" = contact
-        element_id = item.get("element_id")
-        element_type = str(item.get("element_type", ""))
-        lead_id = int(element_id) if element_id and element_type == "1" else None
-        contact_id = int(element_id) if element_id and element_type == "2" else None
+        # contact_id приходит отдельным полем напрямую
+        contact_id = item.get("contact_id")
+        try:
+            contact_id = int(contact_id) if contact_id else None
+        except (ValueError, TypeError):
+            contact_id = None
+
+        # lead_id: берём только если вебхук явно указывает сущность-сделку.
+        # element_type/element_id ненадёжны (element_type=2 при entity_type=lead),
+        # поэтому если поля нет — оставляем None, а app.py дозаполнит через talk_id.
+        entity_type = str(item.get("entity_type") or "")
+        lead_id = None
+        if entity_type == "lead":
+            entity_id = item.get("entity_id")
+            try:
+                lead_id = int(entity_id) if entity_id else None
+            except (ValueError, TypeError):
+                lead_id = None
+
+        talk_id = item.get("talk_id")
 
         created_at = item.get("created_at")
-        if created_at is not None:
-            try:
-                created_at = int(created_at)
-            except (ValueError, TypeError):
-                created_at = int(time.time())
+        try:
+            created_at = int(created_at) if created_at is not None else int(time.time())
+        except (ValueError, TypeError):
+            created_at = int(time.time())
+
+        # Направление: клиент (внешний автор) — входящее, менеджер/бот — исходящее.
+        author_type = str(author.get("type") or "")
+        is_incoming = 0 if author_type in ("user", "bot", "system", "internal") else 1
 
         msg = {
             "message_id": item.get("id"),
             "chat_id": item.get("chat_id"),
+            "talk_id": int(talk_id) if str(talk_id or "").isdigit() else None,
             "lead_id": lead_id,
             "contact_id": contact_id,
             "author_name": author.get("name", ""),
             "author_id": str(author.get("id", "")),
             "text": item.get("text", ""),
             "origin": item.get("origin", ""),
-            "is_incoming": 1 if not author.get("type") == "contact" else 1,
+            "is_incoming": is_incoming,
             "media_url": attachment.get("link"),
             "media_type": attachment.get("type"),
             "created_at": created_at,
             "raw_payload": json.dumps(item, ensure_ascii=False, default=str),
         }
-
-        # Определяем направление: если автор — бот/менеджер, то исходящее
-        # В amoCRM: type=contact — клиент (входящее), иначе — исходящее
-        author_type = author.get("type", "")
-        if author_type in ("user", "bot", "system"):
-            msg["is_incoming"] = 0
-        else:
-            msg["is_incoming"] = 1
-
         messages.append(msg)
 
     return messages

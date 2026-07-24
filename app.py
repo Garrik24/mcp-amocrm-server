@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List, Union
 import os
@@ -36,6 +36,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Mcp-Session-Id должен быть виден клиенту (Streamable HTTP transport)
+    expose_headers=["Mcp-Session-Id"],
 )
 
 # Конфигурация из переменных окружения
@@ -903,14 +905,247 @@ MCP_TOOLS = [
 ]
 
 
+# ========================================================================
+# ОБЩИЙ JSON-RPC ДИСПЕТЧЕР MCP
+# Используется обоими транспортами: legacy SSE (/mcp/sse + /mcp/messages)
+# и Streamable HTTP (/mcp).
+# ========================================================================
+
+# Поддерживаемые ревизии протокола MCP (от новой к старой)
+MCP_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"]
+MCP_LEGACY_PROTOCOL_VERSION = "2024-11-05"
+
+
+def _mcp_error(msg_id: Any, code: int, message: str) -> Dict[str, Any]:
+    """Собрать корректный JSON-RPC error object."""
+    return {
+        "jsonrpc": "2.0",
+        "id": msg_id,
+        "error": {
+            "code": code,
+            "message": message
+        }
+    }
+
+
+def _negotiate_protocol_version(requested: Optional[str]) -> str:
+    """
+    Согласовать ревизию протокола: если клиентскую поддерживаем — отвечаем ею же,
+    иначе предлагаем самую свежую свою.
+    """
+    if requested in MCP_PROTOCOL_VERSIONS:
+        return requested
+    if requested:
+        return MCP_PROTOCOL_VERSIONS[0]
+    return MCP_LEGACY_PROTOCOL_VERSION
+
+
+async def _dispatch_mcp_message(body: Dict[str, Any], session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Обработать одно JSON-RPC сообщение MCP.
+    Возвращает JSON-RPC ответ либо None, если ответ не требуется
+    (уведомление или ответ клиента на серверный запрос).
+    """
+    if not isinstance(body, dict):
+        return _mcp_error(None, -32600, "Invalid Request: ожидается JSON-RPC объект")
+
+    method = body.get("method")
+    params = body.get("params") or {}
+    msg_id = body.get("id")
+    # По JSON-RPC уведомление — это сообщение без поля "id"
+    is_notification = "id" not in body
+
+    logger.info(f"MCP Message (session={session_id}): method={method}")
+
+    # Ответ клиента на серверный запрос — обрабатывать нечего
+    if method is None:
+        if "result" in body or "error" in body:
+            return None
+        return None if is_notification else _mcp_error(msg_id, -32600, "Invalid Request: отсутствует method")
+
+    response = None
+
+    # ---- initialize ----
+    if method == "initialize":
+        response = {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "protocolVersion": _negotiate_protocol_version(params.get("protocolVersion")),
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "amocrm-mcp-server",
+                    "version": "3.0.0"
+                }
+            }
+        }
+
+    # ---- notifications/* ----
+    elif method.startswith("notifications/"):
+        # Уведомления ответа не требуют
+        return None
+
+    # ---- tools/list ----
+    elif method == "tools/list":
+        response = {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "tools": MCP_TOOLS
+            }
+        }
+
+    # ---- tools/call ----
+    elif method == "tools/call":
+        tool_name = params.get("name")
+        tool_args = params.get("arguments", {})
+        result = await _execute_tool(tool_name, tool_args)
+        response = {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(result, ensure_ascii=False, indent=2)
+                    }
+                ]
+            }
+        }
+
+    # ---- ping ----
+    elif method == "ping":
+        response = {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {}
+        }
+
+    # ---- unknown method ----
+    else:
+        response = _mcp_error(msg_id, -32601, f"Method not found: {method}")
+
+    # Уведомлению ответ не полагается, даже если метод известен
+    if is_notification:
+        return None
+
+    return response
+
+
+# ========================================================================
+# MCP STREAMABLE HTTP TRANSPORT
+# spec: https://modelcontextprotocol.io/specification/2025-03-26/basic/transports
+# ========================================================================
+
+# Активные сессии Streamable HTTP: session_id -> время последней активности
+mcp_http_sessions: Dict[str, float] = {}
+
+# Сессия без активности живёт сутки
+MCP_SESSION_TTL = 24 * 60 * 60
+
+
+def _prune_mcp_http_sessions() -> None:
+    """Убрать сессии, которые давно не подавали признаков жизни."""
+    now = time.time()
+    for sid, last_seen in list(mcp_http_sessions.items()):
+        if now - last_seen > MCP_SESSION_TTL:
+            mcp_http_sessions.pop(sid, None)
+            logger.info(f"MCP HTTP: Сессия протухла, sessionId={sid}")
+
+
+@app.post("/mcp")
+async def mcp_streamable_http_endpoint(request: Request):
+    """
+    MCP Streamable HTTP endpoint (ревизия спецификации 2025-03-26).
+    Клиент шлёт сюда JSON-RPC (одиночное сообщение или батч), ответ отдаём
+    одним JSON-объектом. Идентификатор сессии — заголовок Mcp-Session-Id:
+    выдаём его на initialize, читаем на последующих запросах.
+    """
+    session_id = request.headers.get("mcp-session-id")
+
+    try:
+        raw_body = await request.body()
+        payload = json.loads(raw_body)
+    except Exception as e:
+        logger.error(f"MCP HTTP: Не удалось разобрать тело запроса: {str(e)}")
+        return JSONResponse(status_code=400, content=_mcp_error(None, -32700, "Parse error"))
+
+    is_batch = isinstance(payload, list)
+    messages = payload if is_batch else [payload]
+
+    if not messages or not all(isinstance(m, dict) for m in messages):
+        return JSONResponse(status_code=400, content=_mcp_error(None, -32600, "Invalid Request"))
+
+    has_initialize = any(m.get("method") == "initialize" for m in messages)
+
+    if has_initialize:
+        # initialize открывает новую сессию
+        _prune_mcp_http_sessions()
+        session_id = str(uuid.uuid4())
+        mcp_http_sessions[session_id] = time.time()
+        logger.info(f"MCP HTTP: Новая сессия, sessionId={session_id}")
+    elif session_id:
+        # По спецификации на неизвестную сессию отвечаем 404 — клиент переинициализируется
+        if session_id not in mcp_http_sessions:
+            logger.info(f"MCP HTTP: Неизвестная сессия, sessionId={session_id}")
+            return JSONResponse(status_code=404, content=_mcp_error(None, -32001, "Session not found"))
+        mcp_http_sessions[session_id] = time.time()
+
+    responses = []
+    for message in messages:
+        try:
+            response = await _dispatch_mcp_message(message, session_id)
+        except Exception as e:
+            logger.error(f"MCP HTTP ошибка: {str(e)}")
+            response = _mcp_error(message.get("id"), -32603, str(e)) if "id" in message else None
+        if response is not None:
+            responses.append(response)
+
+    headers = {"Mcp-Session-Id": session_id} if session_id else {}
+
+    # В пачке были только уведомления/ответы — по спецификации 202 Accepted с пустым телом
+    if not responses:
+        return Response(status_code=202, headers=headers)
+
+    return JSONResponse(content=responses if is_batch else responses[0], headers=headers)
+
+
 @app.get("/mcp")
+async def mcp_streamable_http_get():
+    """
+    GET на MCP endpoint по спецификации открывает SSE-стрим «сервер → клиент».
+    Мы его не реализуем — спецификация разрешает ответить 405.
+    Legacy SSE-транспорт по-прежнему живёт на /mcp/sse.
+    """
+    return JSONResponse(
+        status_code=405,
+        content=_mcp_error(None, -32601, "Method Not Allowed: SSE-стрим на GET /mcp не поддерживается, используйте POST /mcp"),
+        headers={"Allow": "POST, DELETE"},
+    )
+
+
+@app.delete("/mcp")
+async def mcp_streamable_http_delete(request: Request):
+    """Клиент закрывает сессию Streamable HTTP."""
+    session_id = request.headers.get("mcp-session-id")
+    if session_id:
+        found = mcp_http_sessions.pop(session_id, None) is not None
+        logger.info(f"MCP HTTP: Сессия закрыта клиентом, sessionId={session_id}, найдена={found}")
+    return Response(status_code=204)
+
+
+@app.get("/mcp/info")
 async def mcp_root():
-    """Корневой MCP endpoint для проверки доступности"""
+    """Справочный MCP endpoint для проверки доступности"""
     return {
         "name": "amocrm-mcp-server",
         "version": "3.0.0",
         "protocol": "mcp",
+        "protocolVersions": MCP_PROTOCOL_VERSIONS,
         "endpoints": {
+            "streamable_http": "/mcp",
             "sse": "/mcp/sse",
             "messages": "/mcp/messages"
         },
@@ -982,87 +1217,14 @@ async def mcp_messages_endpoint(request: Request, sessionId: str = Query(...)):
     if not queue:
         raise HTTPException(status_code=400, detail=f"Unknown session: {sessionId}")
 
+    body = None
     try:
         body = await request.json()
-        logger.info(f"MCP Message (session={sessionId}): method={body.get('method')}")
 
-        method = body.get("method")
-        params = body.get("params", {})
-        msg_id = body.get("id")
-
-        response = None
-
-        # ---- initialize ----
-        if method == "initialize":
-            response = {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {}
-                    },
-                    "serverInfo": {
-                        "name": "amocrm-mcp-server",
-                        "version": "3.0.0"
-                    }
-                }
-            }
-
-        # ---- notifications/initialized ----
-        elif method == "notifications/initialized":
-            # Это нотификация, не требует ответа
-            return {"jsonrpc": "2.0"}
-
-        # ---- tools/list ----
-        elif method == "tools/list":
-            response = {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "tools": MCP_TOOLS
-                }
-            }
-
-        # ---- tools/call ----
-        elif method == "tools/call":
-            tool_name = params.get("name")
-            tool_args = params.get("arguments", {})
-            result = await _execute_tool(tool_name, tool_args)
-            response = {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps(result, ensure_ascii=False, indent=2)
-                        }
-                    ]
-                }
-            }
-
-        # ---- ping ----
-        elif method == "ping":
-            response = {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {}
-            }
-
-        # ---- unknown method ----
-        else:
-            response = {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "error": {
-                    "code": -32601,
-                    "message": f"Method not found: {method}"
-                }
-            }
+        response = await _dispatch_mcp_message(body, sessionId)
 
         # Кладём ответ в SSE-очередь, чтобы клиент получил через стрим
-        if response and msg_id is not None:
+        if response and response.get("id") is not None:
             await queue.put(response)
 
         # Также возвращаем в HTTP-теле (Claude использует и то, и другое)
@@ -1070,14 +1232,11 @@ async def mcp_messages_endpoint(request: Request, sessionId: str = Query(...)):
 
     except Exception as e:
         logger.error(f"MCP Messages ошибка: {str(e)}")
-        error_resp = {
-            "jsonrpc": "2.0",
-            "id": body.get("id") if 'body' in dir() else None,
-            "error": {
-                "code": -32603,
-                "message": str(e)
-            }
-        }
+        error_resp = _mcp_error(
+            body.get("id") if isinstance(body, dict) else None,
+            -32603,
+            str(e)
+        )
         if queue:
             await queue.put(error_resp)
         return error_resp

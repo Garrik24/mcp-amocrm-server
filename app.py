@@ -914,23 +914,30 @@ MCP_TOOLS = [
             "(won/count*100, %), spam (сделки с причиной отказа СПАМ). Строки "
             "отсортированы по total.count убыв.\n"
             "mode='rows': плоские строки сделок ';'-разделителем для нестандартного "
-            "анализа. Если после фильтра строк больше 400 — вернётся ошибка с "
-            "разбивкой count по месяцам, надо сузить период или добавить where. "
-            "exclude_spam на mode='rows' не влияет.\n\n"
+            "анализа. Колонки: id;created;pipeline;status;source;interest;city;price;"
+            "loss_reason;responsible;name (первые 50 символов);created_by;tags "
+            "(имена через запятую). Если после фильтра строк больше 400 — вернётся "
+            "ошибка с разбивкой count по месяцам, надо сузить период или добавить "
+            "where. exclude_spam на mode='rows' не влияет.\n\n"
             "group_by (только для aggregate): 'source' (источник, поле 212063), "
             "'interest' (интерес, 212083), 'deal_type' (тип сделки, 212099), "
             "'city' (город, 212029), 'client_type' (тип клиента, 212117), "
             "'responsible' (ответственный, имя), 'pipeline' (воронка, название), "
-            "'status' (статус, название), 'loss_reason' (причина отказа, название). "
+            "'status' (статус, название), 'loss_reason' (причина отказа, название), "
+            "'lead_class' ('Звонок без квалификации' — автосделка от звонка: "
+            "created_by=0, имя вида 'Входящий/Пропущенный/Исходящий/Новая сделка +7…' "
+            "и пустой источник; иначе 'Заявка'). "
             "Пустые значения группируются как 'Не заполнен'.\n\n"
             "period: 'month' (по умолчанию, ключи '2026-01'), 'week' (ISO, "
             "'2026-W05'), 'quarter' ('2026-Q1'), 'none' (без разбивки, один столбец "
             "'total'). Границы периодов считаются по МСК (UTC+3).\n\n"
             "where — фильтр, применяется к выгрузке на лету (без повторного похода в "
             "amoCRM), все ключи опциональны: {'pipeline_id': [1271023], "
-            "'status_id': [142, 143], 'source': ['Авито','2GIS'] (по тексту), "
-            "'interest': [...], 'city': [...], 'responsible_user_id': [...], "
-            "'price_min': 50000, 'price_max': 500000, 'only_spam': true}.\n\n"
+            "'status_id': [142, 143], 'source': ['Авито','2GIS'] (по тексту; "
+            "'Не заполнен' матчит пустой источник), 'interest': [...], 'city': [...], "
+            "'lead_class': ['Заявка'|'Звонок без квалификации'], "
+            "'responsible_user_id': [...], 'price_min': 50000, 'price_max': 500000, "
+            "'only_spam': true}.\n\n"
             "exclude_spam (по умолчанию true) — исключить сделки-спам из метрик "
             "aggregate (в поле spam они всё равно видны, отсев — в excluded_spam). "
             "infer_source (по умолчанию true) — если источник пуст, а в URL "
@@ -944,7 +951,7 @@ MCP_TOOLS = [
                 "date_from": {"type": "string", "description": "Начало периода, включительно, формат YYYY-MM-DD (МСК)"},
                 "date_to": {"type": "string", "description": "Конец периода, включительно, формат YYYY-MM-DD (МСК)"},
                 "mode": {"type": "string", "enum": ["aggregate", "rows"], "default": "aggregate", "description": "aggregate — сводная таблица; rows — плоские строки сделок"},
-                "group_by": {"type": "string", "enum": ["source", "interest", "deal_type", "city", "client_type", "responsible", "pipeline", "status", "loss_reason"], "default": "source", "description": "Признак группировки (только для mode=aggregate)"},
+                "group_by": {"type": "string", "enum": ["source", "interest", "deal_type", "city", "client_type", "responsible", "pipeline", "status", "loss_reason", "lead_class"], "default": "source", "description": "Признак группировки (только для mode=aggregate)"},
                 "period": {"type": "string", "enum": ["month", "week", "quarter", "none"], "default": "month", "description": "Разбивка по времени; none — без разбивки"},
                 "where": {"type": "object", "description": "Фильтр после выгрузки: pipeline_id[], status_id[], source[], interest[], city[], responsible_user_id[], price_min, price_max, only_spam"},
                 "exclude_spam": {"type": "boolean", "default": True, "description": "Исключить спам (причина отказа 22393318) из метрик aggregate"},
@@ -1330,8 +1337,12 @@ _LEADS_MAX = 5
 
 VALID_GROUP_BY = {
     "source", "interest", "deal_type", "city", "client_type",
-    "responsible", "pipeline", "status", "loss_reason",
+    "responsible", "pipeline", "status", "loss_reason", "lead_class",
 }
+
+# Автосделка-звонок: создана системой (created_by==0), имя вида «Входящий +7…»,
+# источник (после инференса) пуст.
+_CALL_NAME_RE = re.compile(r"^(Входящий|Пропущенный|Исходящий|Новая сделка)[\s:]+\+?7")
 
 
 async def _get_ref_data(force: bool = False) -> Dict[str, Any]:
@@ -1416,6 +1427,8 @@ def _normalize_lead(raw: dict, enum_maps: Dict[int, Dict[int, str]]) -> dict:
         "price": raw.get("price") or 0,
         "loss_reason_id": raw.get("loss_reason_id"),
         "responsible_user_id": raw.get("responsible_user_id"),
+        "created_by": raw.get("created_by"),
+        "tags": [t.get("name") for t in ((raw.get("_embedded", {}) or {}).get("tags") or []) if t.get("name")],
         "source": _cf_value(cf, LR_FIELD_SOURCE, enum_maps),
         "interest": _cf_value(cf, LR_FIELD_INTEREST, enum_maps),
         "deal_type": _cf_value(cf, LR_FIELD_DEAL_TYPE, enum_maps),
@@ -1527,6 +1540,15 @@ def _effective_source(lead: dict, infer_source: bool):
     return None, False
 
 
+def _lead_class(lead: dict, eff_source: Optional[str]) -> str:
+    """Класс сделки: «Звонок без квалификации» — автосделка от звонка (created_by==0,
+    имя «Входящий/Пропущенный/Исходящий/Новая сделка +7…», источник пуст); иначе «Заявка»."""
+    if (lead.get("created_by") == 0 and not eff_source
+            and _CALL_NAME_RE.match(lead.get("name") or "")):
+        return "Звонок без квалификации"
+    return "Заявка"
+
+
 def _group_key(lead: dict, group_by: str, ref: dict, eff_source: Optional[str]) -> str:
     if group_by == "source":
         return eff_source or "Не заполнен"
@@ -1552,6 +1574,8 @@ def _group_key(lead: dict, group_by: str, ref: dict, eff_source: Optional[str]) 
         if not lrid:
             return "Не заполнен"
         return ref["loss_names"].get(lrid) or f"loss_{lrid}"
+    if group_by == "lead_class":
+        return _lead_class(lead, eff_source)
     return "Не заполнен"
 
 
@@ -1571,6 +1595,7 @@ def _apply_where(enriched, where: dict):
     interests = _as_list(where.get("interest"))
     cities = _as_list(where.get("city"))
     resp_ids = _as_list(where.get("responsible_user_id"))
+    lead_classes = _as_list(where.get("lead_class"))
     price_min = where.get("price_min")
     price_max = where.get("price_max")
     only_spam = where.get("only_spam")
@@ -1582,13 +1607,16 @@ def _apply_where(enriched, where: dict):
             continue
         if status_ids is not None and lead.get("status_id") not in status_ids:
             continue
-        if sources is not None and (eff_source or "") not in sources:
+        # Пустые значения матчатся строкой «Не заполнен» — как в group_by
+        if sources is not None and (eff_source or "Не заполнен") not in sources:
             continue
-        if interests is not None and (lead.get("interest") or "") not in interests:
+        if interests is not None and (lead.get("interest") or "Не заполнен") not in interests:
             continue
-        if cities is not None and (lead.get("city") or "") not in cities:
+        if cities is not None and (lead.get("city") or "Не заполнен") not in cities:
             continue
         if resp_ids is not None and lead.get("responsible_user_id") not in resp_ids:
+            continue
+        if lead_classes is not None and _lead_class(lead, eff_source) not in lead_classes:
             continue
         if price_min is not None and (lead.get("price") or 0) < price_min:
             continue
@@ -1697,7 +1725,8 @@ async def _leads_report(args: dict) -> dict:
                 return ""
             return str(x).replace(";", ",").replace("\n", " ").replace("\r", " ").strip()
 
-        header = "id;created;pipeline;status;source;interest;city;price;loss_reason;responsible"
+        header = ("id;created;pipeline;status;source;interest;city;price;loss_reason;"
+                  "responsible;name;created_by;tags")
         rows = []
         for lead, eff, _inf in filtered:
             created = (datetime.fromtimestamp(lead["created_at"], MSK_TZ).strftime("%Y-%m-%d")
@@ -1715,6 +1744,9 @@ async def _leads_report(args: dict) -> dict:
                 clean(lead.get("price") or 0),
                 clean(ref["loss_names"].get(lrid, "") if lrid else ""),
                 clean(ref["user_names"].get(lead.get("responsible_user_id"), "")),
+                clean((lead.get("name") or "")[:50]),
+                clean(lead.get("created_by")),
+                clean(",".join(lead.get("tags") or [])),
             ]))
         return {"count": len(rows), "cache": cache_state, "header": header, "rows": rows}
 

@@ -901,6 +901,58 @@ MCP_TOOLS = [
         "name": "get_chat_stats",
         "description": "Статистика по чат-сообщениям: всего, за сегодня, по каналам.",
         "inputSchema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "leads_report",
+        "description": (
+            "Универсальная аналитика по сделкам amoCRM за период. Сервер выгружает "
+            "период целиком, агрегирует у себя и отдаёт компактный результат "
+            "(в кэше 15 мин, повторные вызовы того же периода не ходят в amoCRM).\n\n"
+            "mode='aggregate' (по умолчанию): сводная таблица «группа × период» с "
+            "метриками count, sum (сумма price), won (успешные, статус 142), "
+            "won_sum, lost (закрытые, статус 143), in_progress, conversion "
+            "(won/count*100, %), spam (сделки с причиной отказа СПАМ). Строки "
+            "отсортированы по total.count убыв.\n"
+            "mode='rows': плоские строки сделок ';'-разделителем для нестандартного "
+            "анализа. Если после фильтра строк больше 400 — вернётся ошибка с "
+            "разбивкой count по месяцам, надо сузить период или добавить where. "
+            "exclude_spam на mode='rows' не влияет.\n\n"
+            "group_by (только для aggregate): 'source' (источник, поле 212063), "
+            "'interest' (интерес, 212083), 'deal_type' (тип сделки, 212099), "
+            "'city' (город, 212029), 'client_type' (тип клиента, 212117), "
+            "'responsible' (ответственный, имя), 'pipeline' (воронка, название), "
+            "'status' (статус, название), 'loss_reason' (причина отказа, название). "
+            "Пустые значения группируются как 'Не заполнен'.\n\n"
+            "period: 'month' (по умолчанию, ключи '2026-01'), 'week' (ISO, "
+            "'2026-W05'), 'quarter' ('2026-Q1'), 'none' (без разбивки, один столбец "
+            "'total'). Границы периодов считаются по МСК (UTC+3).\n\n"
+            "where — фильтр, применяется к выгрузке на лету (без повторного похода в "
+            "amoCRM), все ключи опциональны: {'pipeline_id': [1271023], "
+            "'status_id': [142, 143], 'source': ['Авито','2GIS'] (по тексту), "
+            "'interest': [...], 'city': [...], 'responsible_user_id': [...], "
+            "'price_min': 50000, 'price_max': 500000, 'only_spam': true}.\n\n"
+            "exclude_spam (по умолчанию true) — исключить сделки-спам из метрик "
+            "aggregate (в поле spam они всё равно видны, отсев — в excluded_spam). "
+            "infer_source (по умолчанию true) — если источник пуст, а в URL "
+            "объявления (поле 762481) есть 'avito', источник считается 'Авито' "
+            "(число таких — в inferred_source_count). force_refresh (по умолчанию "
+            "false) — проигнорировать кэш периода и выгрузить заново."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "Начало периода, включительно, формат YYYY-MM-DD (МСК)"},
+                "date_to": {"type": "string", "description": "Конец периода, включительно, формат YYYY-MM-DD (МСК)"},
+                "mode": {"type": "string", "enum": ["aggregate", "rows"], "default": "aggregate", "description": "aggregate — сводная таблица; rows — плоские строки сделок"},
+                "group_by": {"type": "string", "enum": ["source", "interest", "deal_type", "city", "client_type", "responsible", "pipeline", "status", "loss_reason"], "default": "source", "description": "Признак группировки (только для mode=aggregate)"},
+                "period": {"type": "string", "enum": ["month", "week", "quarter", "none"], "default": "month", "description": "Разбивка по времени; none — без разбивки"},
+                "where": {"type": "object", "description": "Фильтр после выгрузки: pipeline_id[], status_id[], source[], interest[], city[], responsible_user_id[], price_min, price_max, only_spam"},
+                "exclude_spam": {"type": "boolean", "default": True, "description": "Исключить спам (причина отказа 22393318) из метрик aggregate"},
+                "infer_source": {"type": "boolean", "default": True, "description": "Дозаполнять источник 'Авито' по avito в URL объявления, если источник пуст"},
+                "force_refresh": {"type": "boolean", "default": False, "description": "Игнорировать кэш периода и выгрузить заново"}
+            },
+            "required": ["date_from", "date_to"]
+        }
     }
 ]
 
@@ -1002,6 +1054,9 @@ async def _dispatch_mcp_message(body: Dict[str, Any], session_id: Optional[str] 
         tool_name = params.get("name")
         tool_args = params.get("arguments", {})
         result = await _execute_tool(tool_name, tool_args)
+        # leads_report может отдавать объёмную сводку — сериализуем компактно, чтобы
+        # уложиться в бюджет ответа; остальные инструменты форматируем как прежде.
+        _indent = None if tool_name == "leads_report" else 2
         response = {
             "jsonrpc": "2.0",
             "id": msg_id,
@@ -1009,7 +1064,7 @@ async def _dispatch_mcp_message(body: Dict[str, Any], session_id: Optional[str] 
                 "content": [
                     {
                         "type": "text",
-                        "text": json.dumps(result, ensure_ascii=False, indent=2)
+                        "text": json.dumps(result, ensure_ascii=False, indent=_indent)
                     }
                 ]
             }
@@ -1242,6 +1297,486 @@ async def mcp_messages_endpoint(request: Request, sessionId: str = Query(...)):
         return error_resp
 
 
+# ========================================================================
+# АНАЛИТИКА: leads_report — выгрузка периода целиком, агрегация на сервере
+# ========================================================================
+
+from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
+
+MSK_TZ = timezone(timedelta(hours=3))
+SPAM_LOSS_REASON_ID = 22393318
+
+# ID кастомных полей сделки (проверены по /api/v4/leads/custom_fields)
+LR_FIELD_CITY = 212029          # Город (text)
+LR_FIELD_SOURCE = 212063        # Источник (select)
+LR_FIELD_INTEREST = 212083      # Интерес (select)
+LR_FIELD_DEAL_TYPE = 212099     # Тип сделки (select)
+LR_FIELD_CLIENT_TYPE = 212117   # Тип клиента (select)
+LR_FIELD_AD_URL = 762481        # URL объявления (url)
+
+# amoCRM: статус 142 всегда «успешно реализовано», 143 — «закрыто и не реализовано»
+STATUS_WON = 142
+STATUS_LOST = 143
+
+# Справочники (id→имя), кэш на процесс, обновление раз в час
+_ref_cache: Dict[str, Any] = {"data": None, "ts": 0.0}
+_REF_TTL = 3600
+
+# Кэш выгруженных периодов: (date_from, date_to) -> {"leads":[...], "skipped_deleted":N, "ts":...}
+_leads_cache: "OrderedDict[tuple, dict]" = OrderedDict()
+_LEADS_TTL = 15 * 60
+_LEADS_MAX = 5
+
+VALID_GROUP_BY = {
+    "source", "interest", "deal_type", "city", "client_type",
+    "responsible", "pipeline", "status", "loss_reason",
+}
+
+
+async def _get_ref_data(force: bool = False) -> Dict[str, Any]:
+    """Справочники amoCRM для разворачивания id→текст. Кэш на процесс, TTL 1 час."""
+    now = time.time()
+    if not force and _ref_cache["data"] and now - _ref_cache["ts"] < _REF_TTL:
+        return _ref_cache["data"]
+
+    logger.info("leads_report: обновляю справочники (pipelines, loss_reasons, users, custom_fields)")
+
+    pipelines_raw = await make_amocrm_request("/api/v4/leads/pipelines", "GET")
+    loss_raw = await make_amocrm_request("/api/v4/leads/loss_reasons", "GET", params={"limit": 250})
+    users_raw = await make_amocrm_request("/api/v4/users", "GET", params={"limit": 250})
+    cf_raw = await make_amocrm_request("/api/v4/leads/custom_fields", "GET", params={"limit": 250})
+
+    # Статусы: (pipeline_id, status_id)→имя (142/143 в разных воронках названы по-разному)
+    pipeline_names: Dict[int, str] = {}
+    status_names: Dict[tuple, str] = {}
+    for p in (pipelines_raw.get("_embedded", {}) or {}).get("pipelines", []) or []:
+        pipeline_names[p["id"]] = p.get("name") or str(p["id"])
+        for s in (p.get("_embedded", {}) or {}).get("statuses", []) or []:
+            status_names[(p["id"], s["id"])] = s.get("name") or str(s["id"])
+
+    loss_names: Dict[int, str] = {}
+    for lr in (loss_raw.get("_embedded", {}) or {}).get("loss_reasons", []) or []:
+        loss_names[lr["id"]] = lr.get("name") or str(lr["id"])
+
+    user_names: Dict[int, str] = {}
+    for u in (users_raw.get("_embedded", {}) or {}).get("users", []) or []:
+        user_names[u["id"]] = u.get("name") or u.get("email") or str(u["id"])
+
+    # enum-справочники по кастомным полям — fallback, если inline value пуст
+    enum_maps: Dict[int, Dict[int, str]] = {}
+    for f in (cf_raw.get("_embedded", {}) or {}).get("custom_fields", []) or []:
+        enums = f.get("enums")
+        if enums:
+            enum_maps[f["id"]] = {e["id"]: e["value"] for e in enums}
+
+    data = {
+        "pipeline_names": pipeline_names,
+        "status_names": status_names,
+        "loss_names": loss_names,
+        "user_names": user_names,
+        "enum_maps": enum_maps,
+    }
+    _ref_cache["data"] = data
+    _ref_cache["ts"] = now
+    return data
+
+
+def _cf_value(cf_values, field_id: int, enum_maps: Dict[int, Dict[int, str]]) -> Optional[str]:
+    """Текстовое значение кастомного поля сделки или None. value уже содержит
+    текст enum'а; enum_maps — резервный разворот, если value пуст."""
+    for f in (cf_values or []):
+        if f.get("field_id") == field_id:
+            vals = f.get("values") or []
+            if not vals:
+                return None
+            v = vals[0]
+            text = v.get("value")
+            if (text is None or text == "") and v.get("enum_id") is not None:
+                text = (enum_maps.get(field_id) or {}).get(v["enum_id"])
+            if text is None:
+                return None
+            text = str(text).strip()
+            return text or None
+    return None
+
+
+def _normalize_lead(raw: dict, enum_maps: Dict[int, Dict[int, str]]) -> dict:
+    """Свести сырую сделку к внутреннему представлению (оно же кэшируется)."""
+    cf = raw.get("custom_fields_values")
+    city = _cf_value(cf, LR_FIELD_CITY, enum_maps)
+    if city:
+        city = city.strip().capitalize()
+    return {
+        "id": raw.get("id"),
+        "name": raw.get("name"),
+        "created_at": raw.get("created_at"),
+        "pipeline_id": raw.get("pipeline_id"),
+        "status_id": raw.get("status_id"),
+        "price": raw.get("price") or 0,
+        "loss_reason_id": raw.get("loss_reason_id"),
+        "responsible_user_id": raw.get("responsible_user_id"),
+        "source": _cf_value(cf, LR_FIELD_SOURCE, enum_maps),
+        "interest": _cf_value(cf, LR_FIELD_INTEREST, enum_maps),
+        "deal_type": _cf_value(cf, LR_FIELD_DEAL_TYPE, enum_maps),
+        "city": city,
+        "client_type": _cf_value(cf, LR_FIELD_CLIENT_TYPE, enum_maps),
+        "ad_url": _cf_value(cf, LR_FIELD_AD_URL, enum_maps),
+    }
+
+
+async def _fetch_leads_period(date_from_ts: int, date_to_ts: int,
+                              enum_maps: Dict[int, Dict[int, str]]):
+    """Выгрузить сделки периода постранично (limit=250, order[id]=asc), дедуп по id,
+    пропустить is_deleted. Возвращает (нормализованные, skipped_deleted)."""
+    seen: Dict[int, Optional[dict]] = {}
+    skipped_deleted = 0
+    page = 1
+    MAX_PAGES = 60
+
+    while True:
+        if page > MAX_PAGES:
+            raise ValueError("Период слишком большой, разбей")
+
+        params = {
+            "limit": 250,
+            "with": "loss_reason",
+            "order[id]": "asc",
+            "filter[created_at][from]": date_from_ts,
+            "filter[created_at][to]": date_to_ts,
+            "page": page,
+        }
+
+        result = None
+        for attempt in range(5):
+            result = await make_amocrm_request("/api/v4/leads", "GET", params=params)
+            if isinstance(result, dict) and result.get("status") == "no_content":
+                break
+            if isinstance(result, dict) and result.get("code") == 429:
+                wait = 1.5 * (attempt + 1)
+                logger.info(f"leads_report: 429 rate limit, пауза {wait}s (стр. {page})")
+                await asyncio.sleep(wait)
+                continue
+            break
+
+        if isinstance(result, dict) and result.get("status") == "no_content":
+            break
+
+        leads = (result.get("_embedded", {}) or {}).get("leads") if isinstance(result, dict) else None
+        if not leads:
+            break
+
+        for raw in leads:
+            lid = raw.get("id")
+            if lid in seen:
+                continue
+            if raw.get("is_deleted"):
+                skipped_deleted += 1
+                seen[lid] = None
+                continue
+            seen[lid] = _normalize_lead(raw, enum_maps)
+
+        if not (result.get("_links", {}) or {}).get("next"):
+            break
+        page += 1
+
+    normalized = [v for v in seen.values() if v is not None]
+    logger.info(f"leads_report: выгружено {len(normalized)} сделок, пропущено удалённых {skipped_deleted}, страниц {page}")
+    return normalized, skipped_deleted
+
+
+def _leads_cache_get(key):
+    entry = _leads_cache.get(key)
+    if not entry:
+        return None
+    if time.time() - entry["ts"] > _LEADS_TTL:
+        _leads_cache.pop(key, None)
+        return None
+    _leads_cache.move_to_end(key)
+    return entry
+
+
+def _leads_cache_put(key, leads, skipped_deleted):
+    _leads_cache[key] = {"leads": leads, "skipped_deleted": skipped_deleted, "ts": time.time()}
+    _leads_cache.move_to_end(key)
+    while len(_leads_cache) > _LEADS_MAX:
+        _leads_cache.popitem(last=False)
+
+
+def _period_key(created_at: Optional[int], period: str) -> str:
+    """Ключ периода по МСК: month '2026-01', week '2026-W05', quarter '2026-Q1'."""
+    if period == "none" or not created_at:
+        return "total"
+    dt = datetime.fromtimestamp(created_at, MSK_TZ)
+    if period == "week":
+        iso = dt.isocalendar()
+        return f"{iso[0]:04d}-W{iso[1]:02d}"
+    if period == "quarter":
+        return f"{dt.year:04d}-Q{(dt.month - 1) // 3 + 1}"
+    # month по умолчанию
+    return f"{dt.year:04d}-{dt.month:02d}"
+
+
+def _effective_source(lead: dict, infer_source: bool):
+    """Итоговый источник сделки и признак, что он выведен по URL (инференс)."""
+    src = lead.get("source")
+    if src:
+        return src, False
+    if infer_source and "avito" in (lead.get("ad_url") or "").lower():
+        return "Авито", True
+    return None, False
+
+
+def _group_key(lead: dict, group_by: str, ref: dict, eff_source: Optional[str]) -> str:
+    if group_by == "source":
+        return eff_source or "Не заполнен"
+    if group_by == "interest":
+        return lead.get("interest") or "Не заполнен"
+    if group_by == "deal_type":
+        return lead.get("deal_type") or "Не заполнен"
+    if group_by == "city":
+        return lead.get("city") or "Не заполнен"
+    if group_by == "client_type":
+        return lead.get("client_type") or "Не заполнен"
+    if group_by == "responsible":
+        uid = lead.get("responsible_user_id")
+        return ref["user_names"].get(uid) or (f"user_{uid}" if uid else "Не заполнен")
+    if group_by == "pipeline":
+        pid = lead.get("pipeline_id")
+        return ref["pipeline_names"].get(pid) or (f"pipeline_{pid}" if pid else "Не заполнен")
+    if group_by == "status":
+        pid, sid = lead.get("pipeline_id"), lead.get("status_id")
+        return ref["status_names"].get((pid, sid)) or (f"status_{sid}" if sid else "Не заполнен")
+    if group_by == "loss_reason":
+        lrid = lead.get("loss_reason_id")
+        if not lrid:
+            return "Не заполнен"
+        return ref["loss_names"].get(lrid) or f"loss_{lrid}"
+    return "Не заполнен"
+
+
+def _as_list(v):
+    if v is None:
+        return None
+    return v if isinstance(v, list) else [v]
+
+
+def _apply_where(enriched, where: dict):
+    """Фильтр по кэшу. enriched — список (lead, eff_source, inferred)."""
+    if not where:
+        return enriched
+    pipeline_ids = _as_list(where.get("pipeline_id"))
+    status_ids = _as_list(where.get("status_id"))
+    sources = _as_list(where.get("source"))
+    interests = _as_list(where.get("interest"))
+    cities = _as_list(where.get("city"))
+    resp_ids = _as_list(where.get("responsible_user_id"))
+    price_min = where.get("price_min")
+    price_max = where.get("price_max")
+    only_spam = where.get("only_spam")
+
+    out = []
+    for item in enriched:
+        lead, eff_source, _inferred = item
+        if pipeline_ids is not None and lead.get("pipeline_id") not in pipeline_ids:
+            continue
+        if status_ids is not None and lead.get("status_id") not in status_ids:
+            continue
+        if sources is not None and (eff_source or "") not in sources:
+            continue
+        if interests is not None and (lead.get("interest") or "") not in interests:
+            continue
+        if cities is not None and (lead.get("city") or "") not in cities:
+            continue
+        if resp_ids is not None and lead.get("responsible_user_id") not in resp_ids:
+            continue
+        if price_min is not None and (lead.get("price") or 0) < price_min:
+            continue
+        if price_max is not None and (lead.get("price") or 0) > price_max:
+            continue
+        if only_spam and lead.get("loss_reason_id") != SPAM_LOSS_REASON_ID:
+            continue
+        out.append(item)
+    return out
+
+
+def _new_bucket():
+    return {"count": 0, "sum": 0, "won": 0, "won_sum": 0, "lost": 0, "in_progress": 0, "spam": 0}
+
+
+def _add_to_bucket(b: dict, lead: dict, is_spam: bool, counted: bool):
+    if is_spam:
+        b["spam"] += 1
+    if not counted:
+        return
+    b["count"] += 1
+    price = lead.get("price") or 0
+    b["sum"] += price
+    sid = lead.get("status_id")
+    if sid == STATUS_WON:
+        b["won"] += 1
+        b["won_sum"] += price
+    elif sid == STATUS_LOST:
+        b["lost"] += 1
+    else:
+        b["in_progress"] += 1
+
+
+def _finalize_bucket(b: dict) -> dict:
+    out = dict(b)
+    out["conversion"] = round(b["won"] / b["count"] * 100, 1) if b["count"] else 0.0
+    return out
+
+
+async def _leads_report(args: dict) -> dict:
+    date_from = args.get("date_from")
+    date_to = args.get("date_to")
+    if not date_from or not date_to:
+        return {"error": "Обязательны date_from и date_to в формате YYYY-MM-DD"}
+
+    mode = args.get("mode", "aggregate")
+    group_by = args.get("group_by", "source")
+    period = args.get("period", "month")
+    where = args.get("where") or {}
+    exclude_spam = args.get("exclude_spam", True)
+    infer_source = args.get("infer_source", True)
+    force_refresh = args.get("force_refresh", False)
+
+    if mode not in {"aggregate", "rows"}:
+        return {"error": "mode: aggregate | rows"}
+    if group_by not in VALID_GROUP_BY:
+        return {"error": f"group_by должен быть одним из {sorted(VALID_GROUP_BY)}"}
+    if period not in {"month", "week", "quarter", "none"}:
+        return {"error": "period: month | week | quarter | none"}
+
+    try:
+        d_from = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=MSK_TZ)
+        d_to = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=MSK_TZ)
+    except ValueError:
+        return {"error": "Даты в формате YYYY-MM-DD"}
+    date_from_ts = int(d_from.timestamp())
+    date_to_ts = int(d_to.replace(hour=23, minute=59, second=59).timestamp())
+
+    ref = await _get_ref_data(force=force_refresh)
+    enum_maps = ref["enum_maps"]
+
+    cache_key = (date_from, date_to)
+    cache_state = "miss"
+    entry = None if force_refresh else _leads_cache_get(cache_key)
+    if entry:
+        cache_state = "hit"
+        leads = entry["leads"]
+        skipped_deleted = entry["skipped_deleted"]
+    else:
+        try:
+            leads, skipped_deleted = await _fetch_leads_period(date_from_ts, date_to_ts, enum_maps)
+        except ValueError as e:
+            return {"error": str(e)}
+        _leads_cache_put(cache_key, leads, skipped_deleted)
+
+    # Инференс источника до where — чтобы where по source видел выведенные значения
+    enriched = [(lead,) + _effective_source(lead, infer_source) for lead in leads]
+
+    filtered = _apply_where(enriched, where)
+
+    # ---- mode=rows ----
+    if mode == "rows":
+        if len(filtered) > 400:
+            by_month: Dict[str, int] = {}
+            for lead, _eff, _inf in filtered:
+                mk = _period_key(lead.get("created_at"), "month")
+                by_month[mk] = by_month.get(mk, 0) + 1
+            return {
+                "error": f"Сузь период или добавь фильтр where: строк {len(filtered)}, лимит 400",
+                "cache": cache_state,
+                "count_by_month": dict(sorted(by_month.items())),
+            }
+
+        def clean(x):
+            if x is None:
+                return ""
+            return str(x).replace(";", ",").replace("\n", " ").replace("\r", " ").strip()
+
+        header = "id;created;pipeline;status;source;interest;city;price;loss_reason;responsible"
+        rows = []
+        for lead, eff, _inf in filtered:
+            created = (datetime.fromtimestamp(lead["created_at"], MSK_TZ).strftime("%Y-%m-%d")
+                       if lead.get("created_at") else "")
+            pid, sid = lead.get("pipeline_id"), lead.get("status_id")
+            lrid = lead.get("loss_reason_id")
+            rows.append(";".join([
+                clean(lead.get("id")),
+                created,
+                clean(ref["pipeline_names"].get(pid, "")),
+                clean(ref["status_names"].get((pid, sid), "")),
+                clean(eff),
+                clean(lead.get("interest")),
+                clean(lead.get("city")),
+                clean(lead.get("price") or 0),
+                clean(ref["loss_names"].get(lrid, "") if lrid else ""),
+                clean(ref["user_names"].get(lead.get("responsible_user_id"), "")),
+            ]))
+        return {"count": len(rows), "cache": cache_state, "header": header, "rows": rows}
+
+    # ---- mode=aggregate ----
+    total_passing = len(filtered)
+    spam_in_where = sum(1 for (l, _e, _i) in filtered if l.get("loss_reason_id") == SPAM_LOSS_REASON_ID)
+    excluded_spam = spam_in_where if exclude_spam else 0
+    inferred_count = sum(1 for (_l, _e, inf) in filtered if inf)
+
+    period_keys = set()
+    rows_map: Dict[str, Dict[str, dict]] = {}
+    totals_period: Dict[str, dict] = {}
+    totals_total = _new_bucket()
+
+    for lead, eff, _inf in filtered:
+        is_spam = lead.get("loss_reason_id") == SPAM_LOSS_REASON_ID
+        counted = not (exclude_spam and is_spam)
+        gk = _group_key(lead, group_by, ref, eff)
+        pk = _period_key(lead.get("created_at"), period)
+        period_keys.add(pk)
+
+        grp = rows_map.setdefault(gk, {})
+        _add_to_bucket(grp.setdefault(pk, _new_bucket()), lead, is_spam, counted)
+        _add_to_bucket(grp.setdefault("__total__", _new_bucket()), lead, is_spam, counted)
+        _add_to_bucket(totals_period.setdefault(pk, _new_bucket()), lead, is_spam, counted)
+        _add_to_bucket(totals_total, lead, is_spam, counted)
+
+    columns = ["total"] if period == "none" else sorted(period_keys)
+    total_leads = total_passing - excluded_spam
+
+    out_rows = []
+    for gk, buckets in rows_map.items():
+        by_period = {}
+        for col in columns:
+            src_key = "total" if period == "none" else col
+            if src_key in buckets:
+                by_period[col] = _finalize_bucket(buckets[src_key])
+        total_b = _finalize_bucket(buckets.get("__total__", _new_bucket()))
+        out_rows.append({"key": gk, "by_period": by_period, "total": total_b, "_c": total_b["count"]})
+    out_rows.sort(key=lambda r: r["_c"], reverse=True)
+    for r in out_rows:
+        del r["_c"]
+
+    totals_by_period = {}
+    for col in columns:
+        src_key = "total" if period == "none" else col
+        if src_key in totals_period:
+            totals_by_period[col] = _finalize_bucket(totals_period[src_key])
+
+    return {
+        "period": {"from": date_from, "to": date_to},
+        "total_leads": total_leads,
+        "excluded_spam": excluded_spam,
+        "skipped_deleted": skipped_deleted,
+        "inferred_source_count": inferred_count,
+        "cache": cache_state,
+        "columns": columns,
+        "rows": out_rows,
+        "totals": {"by_period": totals_by_period, "total": _finalize_bucket(totals_total)},
+    }
+
+
 async def _execute_tool(tool_name: str, tool_args: dict) -> dict:
     """Выполнить MCP-инструмент и вернуть результат."""
 
@@ -1450,6 +1985,9 @@ async def _execute_tool(tool_name: str, tool_args: dict) -> dict:
 
     if tool_name == "get_chat_stats":
         return chat_storage.get_stats()
+
+    if tool_name == "leads_report":
+        return await _leads_report(tool_args)
 
     return {"error": f"Unknown tool: {tool_name}"}
 

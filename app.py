@@ -44,6 +44,10 @@ app.add_middleware(
 AMOCRM_SUBDOMAIN = os.getenv("AMOCRM_SUBDOMAIN", "stavgeo26")
 AMOCRM_ACCESS_TOKEN = os.getenv("AMOCRM_ACCESS_TOKEN")  # Долгосрочный токен
 
+# Секретный префикс пути для MCP-эндпоинтов (аутентификация «по пути»).
+# Обязателен: без переменной сервер не поднимется — MCP не должен быть открыт без секрета.
+MCP_PATH_SECRET = os.environ["MCP_PATH_SECRET"]
+
 # Модели данных
 class EntityRequest(BaseModel):
     entity_type: str = Field(..., description="Тип сущности: leads, contacts, companies, tasks, customers")
@@ -1117,7 +1121,7 @@ def _prune_mcp_http_sessions() -> None:
             logger.info(f"MCP HTTP: Сессия протухла, sessionId={sid}")
 
 
-@app.post("/mcp")
+@app.post(f"/{MCP_PATH_SECRET}/mcp")
 async def mcp_streamable_http_endpoint(request: Request):
     """
     MCP Streamable HTTP endpoint (ревизия спецификации 2025-03-26).
@@ -1174,7 +1178,7 @@ async def mcp_streamable_http_endpoint(request: Request):
     return JSONResponse(content=responses if is_batch else responses[0], headers=headers)
 
 
-@app.get("/mcp")
+@app.get(f"/{MCP_PATH_SECRET}/mcp")
 async def mcp_streamable_http_get():
     """
     GET на MCP endpoint по спецификации открывает SSE-стрим «сервер → клиент».
@@ -1188,7 +1192,7 @@ async def mcp_streamable_http_get():
     )
 
 
-@app.delete("/mcp")
+@app.delete(f"/{MCP_PATH_SECRET}/mcp")
 async def mcp_streamable_http_delete(request: Request):
     """Клиент закрывает сессию Streamable HTTP."""
     session_id = request.headers.get("mcp-session-id")
@@ -1198,7 +1202,7 @@ async def mcp_streamable_http_delete(request: Request):
     return Response(status_code=204)
 
 
-@app.get("/mcp/info")
+@app.get(f"/{MCP_PATH_SECRET}/mcp/info")
 async def mcp_root():
     """Справочный MCP endpoint для проверки доступности"""
     return {
@@ -1207,15 +1211,15 @@ async def mcp_root():
         "protocol": "mcp",
         "protocolVersions": MCP_PROTOCOL_VERSIONS,
         "endpoints": {
-            "streamable_http": "/mcp",
-            "sse": "/mcp/sse",
-            "messages": "/mcp/messages"
+            "streamable_http": f"/{MCP_PATH_SECRET}/mcp",
+            "sse": f"/{MCP_PATH_SECRET}/mcp/sse",
+            "messages": f"/{MCP_PATH_SECRET}/mcp/messages"
         },
         "status": "active"
     }
 
 
-@app.get("/mcp/sse")
+@app.get(f"/{MCP_PATH_SECRET}/mcp/sse")
 async def mcp_sse_endpoint(request: Request):
     """
     MCP SSE Transport endpoint.
@@ -1234,7 +1238,7 @@ async def mcp_sse_endpoint(request: Request):
     async def event_generator():
         try:
             # ШАГ 1: Отправляем endpoint — это ОБЯЗАТЕЛЬНОЕ первое сообщение по спецификации MCP
-            yield f"event: endpoint\ndata: /mcp/messages?sessionId={session_id}\n\n"
+            yield f"event: endpoint\ndata: /{MCP_PATH_SECRET}/mcp/messages?sessionId={session_id}\n\n"
 
             # ШАГ 2: Держим соединение открытым, слушаем очередь ответов
             while True:
@@ -1268,7 +1272,7 @@ async def mcp_sse_endpoint(request: Request):
     )
 
 
-@app.post("/mcp/messages")
+@app.post(f"/{MCP_PATH_SECRET}/mcp/messages")
 async def mcp_messages_endpoint(request: Request, sessionId: str = Query(...)):
     """
     MCP JSON-RPC messages endpoint.

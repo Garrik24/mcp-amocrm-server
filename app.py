@@ -964,6 +964,38 @@ MCP_TOOLS = [
             },
             "required": ["date_from", "date_to"]
         }
+    },
+    {
+        "name": "export_leads_contacts",
+        "description": (
+            "Выгрузка сделок с email/телефонами контактов и компаний для рассылок "
+            "(win-back база). Сервер постранично читает сделки периода "
+            "(with=contacts,companies), затем контакты и компании пачками по id, "
+            "джойнит и отдаёт CSV-строки ';'-разделителем.\n\n"
+            "mode='emails' (по умолчанию): уникальные email с агрегацией по адресу. "
+            "Колонки: email;contact;company;leads;sum;won;lost;last_date;last_status;"
+            "last_loss_reason;last_lead. Сортировка по sum убыв. Дубли схлопнуты.\n"
+            "mode='rows': по одной строке на сделку. Колонки: lead_id;created;pipeline;"
+            "status;loss_reason;price;company;contact;email;phone;lead_name. "
+            "Больше 400 строк — ошибка, сузить период или воронки.\n\n"
+            "Фильтры: pipeline_ids (список id воронок; пусто = все; ЮЛ 3887935, "
+            "КАДАСТР 1271023), status_ids (список id статусов; 142 won, 143 lost; "
+            "пусто = все, включая активные). include_no_email (только mode=rows) — "
+            "включать сделки без email. Сервисные адреса (noreply, mailer-daemon, "
+            "@amocrm, @i2crm и т.п.) отсеиваются автоматически."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "Начало периода, включительно, YYYY-MM-DD (МСК)"},
+                "date_to": {"type": "string", "description": "Конец периода, включительно, YYYY-MM-DD (МСК)"},
+                "pipeline_ids": {"type": "array", "items": {"type": "integer"}, "description": "ID воронок (пусто = все). ЮЛ 3887935, КАДАСТР 1271023"},
+                "status_ids": {"type": "array", "items": {"type": "integer"}, "description": "ID статусов: 142 won, 143 lost. Пусто = все, включая активные"},
+                "mode": {"type": "string", "enum": ["emails", "rows"], "default": "emails", "description": "emails — уникальные адреса; rows — по сделкам"},
+                "include_no_email": {"type": "boolean", "default": False, "description": "Только mode=rows: включать сделки без email"}
+            },
+            "required": ["date_from", "date_to"]
+        }
     }
 ]
 
@@ -1067,7 +1099,7 @@ async def _dispatch_mcp_message(body: Dict[str, Any], session_id: Optional[str] 
         result = await _execute_tool(tool_name, tool_args)
         # leads_report может отдавать объёмную сводку — сериализуем компактно, чтобы
         # уложиться в бюджет ответа; остальные инструменты форматируем как прежде.
-        _indent = None if tool_name == "leads_report" else 2
+        _indent = None if tool_name in ("leads_report", "export_leads_contacts") else 2
         response = {
             "jsonrpc": "2.0",
             "id": msg_id,
@@ -1813,6 +1845,267 @@ async def _leads_report(args: dict) -> dict:
     }
 
 
+# ========================================================================
+# EXPORT LEADS CONTACTS — выгрузка сделок с email контактов и компаний
+# для win-back рассылки. Постранично читает сделки периода
+# (with=contacts,companies), затем контакты и компании пачками по id,
+# джойнит и отдаёт CSV-строки ';'-разделителем.
+# ========================================================================
+
+_BAD_EMAIL_RE = re.compile(
+    r"(noreply|no-reply|no_reply|donotreply|mailer-daemon|postmaster"
+    r"|@amocrm|@i2crm|\.local$|\.invalid$)",
+    re.IGNORECASE,
+)
+_EMAIL_RE = re.compile(r"^[^@\s;,]+@[^@\s;,]+\.[a-zA-Zа-яА-Я]{2,}$")
+
+
+def _extract_cf_by_code(cf_values, code: str) -> list:
+    """Все значения системного поля контакта/компании по field_code (EMAIL/PHONE).
+    field_id этих полей в каждом аккаунте свой, field_code — стабильный."""
+    out = []
+    for f in (cf_values or []):
+        if (f.get("field_code") or "").upper() == code:
+            for v in (f.get("values") or []):
+                val = v.get("value")
+                if val:
+                    out.append(str(val).strip())
+    return out
+
+
+def _clean_emails(raw_list) -> list:
+    """Нормализовать email: lower, валидная форма, без сервисных, без дублей."""
+    seen = []
+    for e in raw_list:
+        e = e.strip().lower()
+        if not _EMAIL_RE.match(e):
+            continue
+        if _BAD_EMAIL_RE.search(e):
+            continue
+        if e not in seen:
+            seen.append(e)
+    return seen
+
+
+async def _fetch_entities_by_ids(entity: str, ids: list, batch: int = 100) -> dict:
+    """GET /api/v4/{contacts|companies} пачками filter[id][]. Возвращает {id: raw}."""
+    result: Dict[int, dict] = {}
+    ids = [i for i in ids if i]
+    for i in range(0, len(ids), batch):
+        chunk = ids[i:i + batch]
+        params = {"limit": 250}
+        for j, eid in enumerate(chunk):
+            params[f"filter[id][{j}]"] = eid
+        resp = None
+        for attempt in range(5):
+            resp = await make_amocrm_request(f"/api/v4/{entity}", "GET", params=params)
+            if isinstance(resp, dict) and resp.get("code") == 429:
+                wait = 1.5 * (attempt + 1)
+                logger.info(f"export_leads_contacts: 429 на {entity}, пауза {wait}s")
+                await asyncio.sleep(wait)
+                continue
+            break
+        if isinstance(resp, dict):
+            for item in (resp.get("_embedded", {}) or {}).get(entity, []) or []:
+                result[item["id"]] = item
+        await asyncio.sleep(0.2)
+    logger.info(f"export_leads_contacts: {entity} загружено {len(result)} из {len(ids)}")
+    return result
+
+
+async def _export_leads_contacts(args: dict) -> dict:
+    # --- Параметры ---
+    try:
+        d_from = datetime.strptime(args["date_from"], "%Y-%m-%d").replace(tzinfo=MSK_TZ)
+        d_to = datetime.strptime(args["date_to"], "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, tzinfo=MSK_TZ)
+    except (KeyError, ValueError):
+        return {"error": "date_from/date_to обязательны, формат YYYY-MM-DD"}
+    ts_from, ts_to = int(d_from.timestamp()), int(d_to.timestamp())
+
+    pipeline_ids = sorted({int(x) for x in (args.get("pipeline_ids") or [])})
+    status_ids = {int(x) for x in (args.get("status_ids") or [])}
+    mode = args.get("mode", "emails")
+    include_no_email = bool(args.get("include_no_email", False))
+
+    ref = await _get_ref_data()
+    loss_names = ref["loss_names"]
+    pipeline_names = ref["pipeline_names"]
+
+    # --- 1. Сделки периода с контактами и компаниями ---
+    leads: Dict[int, dict] = {}
+    page = 1
+    MAX_PAGES = 40
+    while True:
+        if page > MAX_PAGES:
+            return {"error": "Период слишком большой (>10 000 сделок), разбей на части"}
+        params = {
+            "limit": 250,
+            "with": "contacts,companies,loss_reason",
+            "order[id]": "asc",
+            "filter[created_at][from]": ts_from,
+            "filter[created_at][to]": ts_to,
+            "page": page,
+        }
+        for j, pid in enumerate(pipeline_ids):
+            params[f"filter[pipeline_id][{j}]"] = pid
+
+        resp = None
+        for attempt in range(5):
+            resp = await make_amocrm_request("/api/v4/leads", "GET", params=params)
+            if isinstance(resp, dict) and resp.get("code") == 429:
+                wait = 1.5 * (attempt + 1)
+                logger.info(f"export_leads_contacts: 429 на leads, пауза {wait}s (стр. {page})")
+                await asyncio.sleep(wait)
+                continue
+            break
+        if not isinstance(resp, dict) or resp.get("status") == "no_content":
+            break
+        raw_leads = (resp.get("_embedded", {}) or {}).get("leads") or []
+        if not raw_leads:
+            break
+
+        for raw in raw_leads:
+            if raw.get("is_deleted"):
+                continue
+            if status_ids and raw.get("status_id") not in status_ids:
+                continue
+            emb = raw.get("_embedded", {}) or {}
+            contacts = emb.get("contacts") or []
+            companies = emb.get("companies") or []
+            leads[raw["id"]] = {
+                "id": raw["id"],
+                "name": (raw.get("name") or "")[:60],
+                "created_at": raw.get("created_at"),
+                "pipeline_id": raw.get("pipeline_id"),
+                "status_id": raw.get("status_id"),
+                "price": raw.get("price") or 0,
+                "loss_reason_id": raw.get("loss_reason_id"),
+                "contact_ids": [c["id"] for c in contacts],
+                "main_contact_id": next(
+                    (c["id"] for c in contacts if c.get("is_main")),
+                    contacts[0]["id"] if contacts else None),
+                "company_id": companies[0]["id"] if companies else None,
+            }
+
+        if not (resp.get("_links", {}) or {}).get("next"):
+            break
+        page += 1
+        await asyncio.sleep(0.2)
+
+    if not leads:
+        return {"period": {"from": args["date_from"], "to": args["date_to"]},
+                "total_leads": 0, "note": "Сделок не найдено"}
+
+    # --- 2. Контакты и компании пачками ---
+    contact_ids = sorted({cid for l in leads.values() for cid in l["contact_ids"]})
+    company_ids = sorted({l["company_id"] for l in leads.values() if l["company_id"]})
+    contacts_map = await _fetch_entities_by_ids("contacts", contact_ids)
+    companies_map = await _fetch_entities_by_ids("companies", company_ids)
+
+    # --- 3. Джойн: email/телефон на каждую сделку ---
+    rows = []
+    for l in sorted(leads.values(), key=lambda x: x["created_at"] or 0):
+        emails, phones, contact_name = [], [], ""
+        ordered = ([l["main_contact_id"]] if l["main_contact_id"] else []) + \
+                  [c for c in l["contact_ids"] if c != l["main_contact_id"]]
+        for cid in ordered:
+            c = contacts_map.get(cid)
+            if not c:
+                continue
+            if not contact_name:
+                contact_name = (c.get("name") or "").strip()
+            emails += _extract_cf_by_code(c.get("custom_fields_values"), "EMAIL")
+            phones += _extract_cf_by_code(c.get("custom_fields_values"), "PHONE")
+
+        company_name, comp_emails = "", []
+        comp = companies_map.get(l["company_id"]) if l["company_id"] else None
+        if comp:
+            company_name = (comp.get("name") or "").strip()
+            comp_emails = _extract_cf_by_code(comp.get("custom_fields_values"), "EMAIL")
+
+        all_emails = _clean_emails(emails + comp_emails)
+        created = (datetime.fromtimestamp(l["created_at"], MSK_TZ).strftime("%Y-%m-%d")
+                   if l["created_at"] else "")
+        if l["status_id"] == STATUS_WON:
+            status_txt = "won"
+        elif l["status_id"] == STATUS_LOST:
+            status_txt = "lost"
+        else:
+            status_txt = "in_progress"
+        rows.append({
+            "lead_id": l["id"],
+            "created": created,
+            "pipeline": pipeline_names.get(l["pipeline_id"], str(l["pipeline_id"])),
+            "status": status_txt,
+            "loss_reason": loss_names.get(l["loss_reason_id"], "") if l["loss_reason_id"] else "",
+            "price": l["price"],
+            "company": company_name,
+            "contact": contact_name,
+            "emails": all_emails,
+            "phone": phones[0] if phones else "",
+            "lead_name": l["name"].replace(";", ","),
+        })
+
+    with_email = [r for r in rows if r["emails"]]
+    without_email = len(rows) - len(with_email)
+
+    # --- 4a. mode='rows': по строке на сделку ---
+    if mode == "rows":
+        out_rows = rows if include_no_email else with_email
+        if len(out_rows) > 400:
+            return {"error": f"Строк {len(out_rows)} (>400), сузь период или воронки",
+                    "total_leads": len(rows), "with_email": len(with_email)}
+        header = ("lead_id;created;pipeline;status;loss_reason;price;"
+                  "company;contact;email;phone;lead_name")
+        lines = [";".join([
+            str(r["lead_id"]), r["created"], r["pipeline"], r["status"],
+            r["loss_reason"], str(r["price"]),
+            r["company"].replace(";", ","), r["contact"].replace(";", ","),
+            ",".join(r["emails"]), r["phone"], r["lead_name"],
+        ]) for r in out_rows]
+        return {"period": {"from": args["date_from"], "to": args["date_to"]},
+                "total_leads": len(rows), "with_email": len(with_email),
+                "without_email": without_email, "header": header, "rows": lines}
+
+    # --- 4b. mode='emails': уникальные адреса с агрегацией ---
+    by_email: Dict[str, dict] = {}
+    for r in with_email:
+        for e in r["emails"]:
+            b = by_email.setdefault(e, {
+                "email": e, "contact": r["contact"], "company": r["company"],
+                "leads": 0, "sum": 0, "won": 0, "lost": 0,
+                "last_date": "", "last_status": "", "last_loss": "", "last_lead": "",
+            })
+            b["leads"] += 1
+            b["sum"] += r["price"]
+            if r["status"] == "won":
+                b["won"] += 1
+            if r["status"] == "lost":
+                b["lost"] += 1
+            if r["created"] >= b["last_date"]:
+                b["last_date"] = r["created"]
+                b["last_status"] = r["status"]
+                b["last_loss"] = r["loss_reason"]
+                b["last_lead"] = r["lead_name"]
+                if r["company"]:
+                    b["company"] = r["company"]
+                if r["contact"]:
+                    b["contact"] = r["contact"]
+
+    header = ("email;contact;company;leads;sum;won;lost;"
+              "last_date;last_status;last_loss_reason;last_lead")
+    lines = [";".join([
+        b["email"], b["contact"].replace(";", ","), b["company"].replace(";", ","),
+        str(b["leads"]), str(b["sum"]), str(b["won"]), str(b["lost"]),
+        b["last_date"], b["last_status"], b["last_loss"], b["last_lead"],
+    ]) for b in sorted(by_email.values(), key=lambda x: (-x["sum"], x["email"]))]
+    return {"period": {"from": args["date_from"], "to": args["date_to"]},
+            "total_leads": len(rows), "with_email": len(with_email),
+            "without_email": without_email, "unique_emails": len(by_email),
+            "header": header, "rows": lines}
+
+
 async def _execute_tool(tool_name: str, tool_args: dict) -> dict:
     """Выполнить MCP-инструмент и вернуть результат."""
 
@@ -2024,6 +2317,9 @@ async def _execute_tool(tool_name: str, tool_args: dict) -> dict:
 
     if tool_name == "leads_report":
         return await _leads_report(tool_args)
+
+    if tool_name == "export_leads_contacts":
+        return await _export_leads_contacts(tool_args)
 
     return {"error": f"Unknown tool: {tool_name}"}
 

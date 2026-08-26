@@ -327,6 +327,42 @@ async def _resolve_lead_id_by_talk(talk_id) -> Optional[int]:
     return lead_id
 
 
+# ============== Ретранслятор вебхуков для сервиса расшифровки звонков ==============
+# 26.08.2026 amoCRM перестал доставлять вебхуки на домен voice-transcription
+# (похоже, домен пессимизирован после получасового зависания сервиса 25.08),
+# при этом на домен этого сервиса доставка работает. Принимаем note_lead/note_contact
+# здесь и пересылаем как есть — тот же form-urlencoded, тот же путь /webhook/amocrm.
+VOICE_WEBHOOK_URL = os.getenv(
+    "VOICE_WEBHOOK_URL",
+    "https://voice-transcription-production.up.railway.app/webhook/amocrm",
+)
+
+
+@app.post("/webhooks/voice-relay")
+async def voice_relay_webhook(request: Request):
+    """Пересылает вебхук amoCRM в сервис транскрибации, отвечая амо сразу."""
+    raw = await request.body()
+    ctype = request.headers.get("content-type", "application/x-www-form-urlencoded")
+
+    async def _forward(data: bytes, content_type: str):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    VOICE_WEBHOOK_URL,
+                    data=data,
+                    headers={"Content-Type": content_type},
+                    timeout=aiohttp.ClientTimeout(total=25),
+                ) as resp:
+                    logger.info(f"🔁 voice-relay → {resp.status} ({len(data)} байт)")
+        except Exception as e:
+            logger.error(f"❌ voice-relay: не переслал вебхук: {e}")
+
+    # Отвечаем амо мгновенно, пересылку не ждём — иначе таймауты накопятся
+    # и амо пессимизирует уже ЭТОТ домен (чем всё и началось)
+    asyncio.create_task(_forward(raw, ctype))
+    return {"status": "relayed"}
+
+
 @app.post("/webhooks/receive")
 async def receive_webhook(request: Request):
     """Приём вебхуков от AmoCRM — включая чат-сообщения.

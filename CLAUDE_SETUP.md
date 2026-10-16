@@ -256,3 +256,4 @@ tail -f ~/Library/Logs/Claude/mcp*.log
 ```
 
 
+

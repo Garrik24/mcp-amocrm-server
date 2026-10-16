@@ -1,0 +1,107 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "AmoCRM GPT Assistant",
+    "description": "API для интеграции AmoCRM с ChatGPT",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "https://mcp-amocrm-server-production.up.railway.app",
+      "description": "AmoCRM сервер на Railway"
+    }
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "summary": "Статус сервера",
+        "operationId": "get_server_status",
+        "responses": {
+          "200": {
+            "description": "Статус сервера",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {"type": "string"},
+                    "service": {"type": "string"},
+                    "version": {"type": "string"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/entities": {
+      "post": {
+        "summary": "Работа с сущностями AmoCRM",
+        "operationId": "manage_amocrm_entities",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "entity_type": {
+                    "type": "string",
+                    "enum": ["leads", "contacts", "companies"],
+                    "description": "Тип сущности"
+                  },
+                  "method": {
+                    "type": "string", 
+                    "enum": ["get", "post"],
+                    "description": "Метод операции"
+                  },
+                  "params": {
+                    "type": "object",
+                    "description": "Параметры (лимит, фильтры)"
+                  },
+                  "data": {
+                    "type": "object", 
+                    "description": "Данные для создания"
+                  }
+                },
+                "required": ["entity_type", "method"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Результат операции",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/account": {
+      "get": {
+        "summary": "Информация об аккаунте",
+        "operationId": "get_account_info",
+        "responses": {
+          "200": {
+            "description": "Информация об аккаунте",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+

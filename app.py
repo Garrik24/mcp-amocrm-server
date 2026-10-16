@@ -12,6 +12,7 @@ import time
 import json
 import asyncio
 import uuid
+import hmac
 from urllib.parse import quote, parse_qsl
 from dotenv import load_dotenv
 import chat_storage
@@ -40,6 +41,56 @@ app.add_middleware(
     expose_headers=["Mcp-Session-Id"],
 )
 
+# Middleware для защиты REST API /api/* эндпоинтов
+@app.middleware("http")
+async def api_auth_middleware(request: Request, call_next):
+    """
+    Защита всех /api/* эндпоинтов обязательной авторизацией.
+    Принимает Bearer token или X-API-Key заголовок.
+    Использует constant-time comparison для защиты от timing attacks.
+    """
+    path = request.url.path
+    
+    # Проверяем, требуется ли авторизация (только для /api/*)
+    if path.startswith("/api/"):
+        # Если API_SECRET_KEY не задан - fail closed (отказываем)
+        if not API_SECRET_KEY:
+            logger.warning(f"❌ Unauthorized request to {path} - API_SECRET_KEY not configured")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "Service Unavailable",
+                    "detail": "API authentication is not configured. Contact administrator."
+                }
+            )
+        
+        # Извлекаем токен из заголовков
+        auth_header = request.headers.get("authorization", "")
+        api_key_header = request.headers.get("x-api-key", "")
+        
+        provided_token = ""
+        if auth_header.startswith("Bearer "):
+            provided_token = auth_header[7:]
+        elif api_key_header:
+            provided_token = api_key_header
+        
+        # Constant-time comparison для защиты от timing attacks
+        if not provided_token or not hmac.compare_digest(provided_token, API_SECRET_KEY):
+            logger.warning(f"❌ Unauthorized request to {path} from {request.client.host if request.client else 'unknown'}")
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "Unauthorized",
+                    "detail": "Invalid or missing API key. Provide Authorization: Bearer <token> or X-API-Key: <token> header."
+                }
+            )
+        
+        logger.info(f"✅ Authorized request to {path}")
+    
+    # Пропускаем запрос дальше
+    response = await call_next(request)
+    return response
+
 # Конфигурация из переменных окружения
 AMOCRM_SUBDOMAIN = os.getenv("AMOCRM_SUBDOMAIN", "stavgeo26")
 AMOCRM_ACCESS_TOKEN = os.getenv("AMOCRM_ACCESS_TOKEN")  # Долгосрочный токен
@@ -47,6 +98,15 @@ AMOCRM_ACCESS_TOKEN = os.getenv("AMOCRM_ACCESS_TOKEN")  # Долгосрочны
 # Секретный префикс пути для MCP-эндпоинтов (аутентификация «по пути»).
 # Обязателен: без переменной сервер не поднимется — MCP не должен быть открыт без секрета.
 MCP_PATH_SECRET = os.environ["MCP_PATH_SECRET"]
+
+# Секретный ключ для защиты REST API /api/* эндпоинтов.
+# Обязателен: без переменной сервер будет отказывать в доступе к /api/* (fail closed).
+API_SECRET_KEY = os.getenv("API_SECRET_KEY", "")
+if not API_SECRET_KEY:
+    logger.warning(
+        "⚠️  API_SECRET_KEY не задан — все запросы к /api/* будут отклонены. "
+        "Задайте переменную окружения API_SECRET_KEY для защиты REST API."
+    )
 
 # Модели данных
 class EntityRequest(BaseModel):
